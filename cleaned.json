@@ -1,0 +1,129 @@
+{
+  "meeting_purpose": "To discuss the role of AI in daily life, provide updates on project progress, and address recent client updates and ongoing issues.",
+  "key_takeaways": [
+    "Ajaz is working on the transcription and summarization project, with 30% completed.",
+    "A new client, Omanteli, will be added to the agent pool, expected to generate approximately 2 crore in turnover annually.",
+    "Reliance is anticipated to join the partnership soon.",
+    "Technical issues have been affecting meeting participation and need resolution."
+  ],
+  "decisions": [
+    "Proceed with the addition of Omanteli as a new client to the agent pool.",
+    "Address ongoing technical issues to ensure smoother future meetings."
+  ],
+  "topics": [
+    {
+      "title": "AI's Role in Daily Life",
+      "problem": "Understanding the impact of AI on home and personal life.",
+      "solution": "Discussion on AI features and their relevance.",
+      "rationale": "To explore how AI can enhance everyday experiences.",
+      "postponed_items": []
+    },
+    {
+      "title": "Project Updates",
+      "problem": null,
+      "solution": "Ajaz will complete the transcription and summarization task by tomorrow.",
+      "rationale": "To ensure timely progress on the project.",
+      "postponed_items": []
+    },
+    {
+      "title": "Client Updates",
+      "problem": null,
+      "solution": "Onboard Omanteli as a new client and anticipate Reliance's participation.",
+      "rationale": "These clients are expected to contribute significantly to revenue.",
+      "postponed_items": []
+    },
+    {
+      "title": "Technical Issues",
+      "problem": "Repeated technical difficulties during meetings.",
+      "solution": "Address the technical issues to ensure smoother future meetings.",
+      "rationale": "To improve participation and communication effectiveness.",
+      "postponed_items": []
+    }
+  ],
+  "action_items": [
+    {
+      "owner": "Ajaz",
+      "task": "Complete the transcription and summarization project.",
+      "priority": "high",
+      "deadline": "Tomorrow"
+    },
+    {
+      "owner": "Ajaz Ali",
+      "task": "Follow up with the technical team to resolve meeting issues.",
+      "priority": "high",
+      "deadline": null
+    }
+  ],
+  "blockers": [
+    "Ongoing technical issues affecting meeting attendance and participation."
+  ],
+  "next_steps": [
+    "Ajaz to inform the team upon completion of the transcription and summarization task.",
+    "Coordinate with the team regarding the new client's integration.",
+    "Monitor the onboarding process for Omanteli.",
+    "Prepare for Reliance's upcoming involvement."
+  ],
+  "transcript_dict": [
+    "Ajaz Ali-3191: Hello. : 1774253893284",
+    "Ajaz Ali-3191: Hello : 1774253893965",
+    "Ajaz Ali-3191: Hi मेरा नाम इज़ाद से है. : 1774253897083",
+    "Ajaz Ali-3191: Mira naam Ejaos : 1774253903233",
+    "Ajaz Ali-3191: Ellas : 1774253906866",
+    "Ajaz Ali-3191: Hi. My name is my name is Ajaz. : 1774253912333",
+    "Ajaz Ali-3191: So key in this name, new memory. : 1774253922020",
+    "Ajaz Ali-3191: So keep this name in your memory. : 1774253930343",
+    "Ajaz Ali-3191: So that you should not forget my name. : 1774253938184",
+    "Ajaz Ali-3191: So this meeting is regarding : 1774253948166",
+    "Ajaz Ali-3191: AI, Sumit. : 1774253951572",
+    "Ajaz Ali-3191: Ok. : 1774253961634",
+    "Ajaz Ali-3191: Raised some points about the AI. : 1774253964334",
+    "Ajaz Ali-3191: Impact it : 1774253964974",
+    "Ajaz Ali-3191: about the what AI role in home and life. : 1774253980983",
+    "Ajaz Ali-3191: I'm talking what AI role in home in life. : 1774253990283",
+    "Ajaz Ali-3191: What AI role in human life? : 1774253999234",
+    "Ajaz Ali-3191: So, este es : 1774254008483",
+    "Ajaz Ali-3191: Or not? : 1774254013919",
+    "Ajaz Ali-3191: So here we have a little bit : 1774254029134",
+    "Ajaz Ali-3191: discuss about the AI features. : 1774254037383",
+    "Ajaz Ali-3191: We have Agurgandi : 1774254043733",
+    "Ajaz Ali-3191: Yes. : 1774254059833",
+    "Ajaz Ali-3191: Hello? : 1774254061066",
+    "Ajaz Ali-3191: How's going? : 1774254074483",
+    "Ajaz Ali-3191: So I'm working on transcription and summarization part. It has been completed by tomorrow. : 1774254094183",
+    "Ajaz Ali-3191: So I have done around 30% work on this. : 1774254099084",
+    "Ajaz Ali-3191: After that, once I completed the task, then I will let you know. : 1774254104283",
+    "Ajaz Ali-3191: Also, I just want to : 1774254116183",
+    "Ajaz Ali-3191: allow announcement that the 1 new client should be live on I mean, will : 1774254123883",
+    "Ajaz Ali-3191: the new client will be add in our own agent pool. Coordinate with us. Who will : 1774254131934",
+    "Ajaz Ali-3191: join : 1774254134833",
+    "Ajaz Ali-3191: very soon. : 1774254138733",
+    "Ajaz Ali-3191: The client will : 1774254141934",
+    "Ajaz Ali-3191: join : 1774254145133",
+    "Ajaz Ali-3191: us very soon. The client very soon join us : 1774254147534",
+    "Ajaz Ali-3191: So we are very grateful. : 1774254155584",
+    "Ajaz Ali-3191: To have a good news. : 1774254157276",
+    "Ajaz Ali-3191: Because this client is very you know? This client is very : 1774254166183",
+    "Ajaz Ali-3191: important to all of us. : 1774254169583",
+    "Ajaz Ali-3191: So that : 1774254174984",
+    "Ajaz Ali-3191: it will generate around 2 CR : 1774254176818",
+    "Ajaz Ali-3191: you know, 2 CR : 1774254179033",
+    "Ajaz Ali-3191: It will give the 2 CR turnover. : 1774254190183",
+    "Ajaz Ali-3191: In a year. : 1774254194084",
+    "Ajaz Ali-3191: So that is the massive in : 1774254197634",
+    "Ajaz Ali-3191: very, very good news for all of us. : 1774254200833",
+    "Ajaz Ali-3191: And the other client will minus, you know, sort : 1774254207934",
+    "Ajaz Ali-3191: period. How's the name is? : 1774254211483",
+    "Ajaz Ali-3191: You know, the lines. : 1774254214633",
+    "Ajaz Ali-3191: So Reliance, will also join us : 1774254218784",
+    "Ajaz Ali-3191: in very short time. So we have a good 2 good news which is 1 of our client, which is : 1774254232634",
+    "Ajaz Ali-3191: which have around 2 CR which is it will get us around to see our in a year. : 1774254245784",
+    "Ajaz Ali-3191: Which which name is Omanteli. And the other thing which is we have, which is : 1774254250183",
+    "Ajaz Ali-3191: कहां लगा है भाई? अभय? ठीक है : 1774254256834",
+    "Ajaz Ali-3191: अरे यार. फिर punch out हो गया यार. : 1774254275934",
+    "Ajaz Ali-3191: क्या आया? मेरे दिमाग ही पागल हो गया भाई. Open करके जा करो ना. : 1774254292683",
+    "Ajaz Ali-3191: अरे करके गया था. मैंने यह मार दिया यार जल्दबाज़ी में. : 1774254293428",
+    "Ajaz Ali-3191: This thing will : 1774254314265",
+    "Ajaz Ali-3191: happen again and again, I am very shocked. : 1774254320583",
+    "Ajaz Ali-3191: I forgot multiple time. : 1774254326634"
+  ]
+}

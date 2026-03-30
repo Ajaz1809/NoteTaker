@@ -7,12 +7,11 @@ from fastapi.middleware.cors import CORSMiddleware  # Import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware  # Import GZip compression
 
 from utils.helpers import format_response
-from routes import router
+from routes.routes import router
 from db.database import engine, Base, note_engine, NoteTakerBase
 import os
 app = FastAPI()
 app.include_router(router)
-
 
 # Create database tables
 # Base.metadata.drop_all(bind=engine)
@@ -20,7 +19,6 @@ app.include_router(router)
 Base.metadata.create_all(bind=engine)
 # Create tables in NoteTaker DB
 NoteTakerBase.metadata.create_all(bind=note_engine)
-
 
 app.mount("/files", StaticFiles(directory="uploads"), name="files")
 
@@ -44,7 +42,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     errors = []
@@ -60,14 +57,12 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         ),
     )
 
-
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     return JSONResponse(
         status_code=exc.status_code,
         content={"status": False, "message": exc.detail, "data": None},
     )
-
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):

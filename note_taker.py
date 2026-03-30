@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 from livekit import rtc
 from tasks import analyze_transcript  # import at top
-from openai._exceptions import APITimeoutError
+# from openai._exceptions import APITimeoutError
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -23,34 +23,41 @@ from livekit.agents import (
 )
 from livekit.plugins import deepgram, silero
 from openai import OpenAI
-from db.database import NoteTakerSessionLocal, ConferenceSessionLocal
-from models.models import NoteTakerCall, ConferenceSummary
+from db.database import NoteTakerSessionLocal
+from models.models import NoteTakerCall
 from livekit.agents import JobRequest
 from typing import Optional
+import os
 
 load_dotenv()
-
 logger = logging.getLogger("transcriber")
 client = OpenAI()
-
 
 class Transcriber(Agent):
     def __init__(self, *, participant_identity: str, transcript_collector: list):
         try:
             stt_engine = deepgram.STT(
-                model="nova-3",
-                language="multi",
-                interim_results=True,
-                punctuate=True,
-                smart_format=True,
-                numerals=True,
-                sample_rate=16000,
-                no_delay=True,
-                endpointing_ms=25,
-                filler_words=True,
-                profanity_filter=False,
-                mip_opt_out=True,
-            )
+            model="nova-3",
+            language="multi",
+            # CRITICAL: Disable interim results so we only get high-confidence final sentences
+            interim_results=True, 
+            # CRITICAL: Increase endpointing to 1 second so pauses don't break sentences
+            endpointing_ms=100,
+            # CRITICAL: Disable no_delay to allow the AI to use context for better grammar
+            no_delay=True,
+            punctuate=True,
+            smart_format=True,
+            # CRITICAL: Enable numerals for better readability of numbers in transcripts
+            numerals=True,
+            # CRITICAL: Set sample rate for optimal audio processing
+            sample_rate=16000,
+            # Fathom removes filler words ("um", "uh") for a professional transcript
+            filler_words=True, 
+            # Fathom's profanity filter is aggressive and can break non-English sentences, so we disable it for multilingual support
+            profanity_filter=False,
+            # CRITICAL: Opt out of MIP (Multi-Input Processing) for better control
+            mip_opt_out=True, 
+                            )
         except Exception as e:
             logger.error(f"❌ Failed to init Deepgram STT: {e}")
             # Fallback: Disable STT, still run Agent
@@ -59,9 +66,39 @@ class Transcriber(Agent):
         else:
             self.stt_error = None
 
-        super().__init__(instructions="not-needed", stt=stt_engine)
+        # super().__init__(instructions="not-needed", stt=stt_engine)
+        super().__init__(instructions="Silent observer", stt=stt_engine)
         self.participant_identity = participant_identity
         self.transcript_collector = transcript_collector
+        
+    async def clean_transcript_with_llm(self, raw_text: str):
+        """
+        Multi-language aware cleaning.
+        """
+        try:
+            # We use GPT-4o-mini because it is natively multilingual
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system", 
+                        "content": (
+                            "You are a transcript polisher for multilingual meetings. "
+                            "Fix punctuation and spelling for the language provided. "
+                            "DO NOT translate the text. If it is in Hindi, keep it in Hindi. "
+                            "If it is in English, keep it in English. "
+                            "Only fix errors and formatting. Keep it 100% authentic to the speaker's intent."
+                        )
+                    },
+                    {"role": "user", "content": raw_text}
+                ],
+                max_tokens=500,
+                temperature=0
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"LLM Cleaning failed: {e}")
+            return raw_text
 
     async def on_user_turn_completed(
         self, chat_ctx: llm.ChatContext, new_message: llm.ChatMessage
@@ -80,7 +117,6 @@ class Transcriber(Agent):
             self.transcript_collector.append(f"ERROR: {str(e)}")
         finally:
             raise StopResponse()
-
 
 class MultiUserTranscriber:
     def __init__(self, ctx: JobContext, existing_call_id: Optional[str] = None):
@@ -139,7 +175,6 @@ class MultiUserTranscriber:
             # ✅ Only save if transcripts exist
             if self.transcript_data:
                 new_transcript_entry = list(map(str, self.transcript_data))
-
                 db = NoteTakerSessionLocal()
                 try:
                     # 1. Fetch by stored ID or search for an ACTIVE one if ID is missing
@@ -387,30 +422,26 @@ class MultiUserTranscriber:
         )
         await room_io.start()
 
-        from livekit.plugins import bey
-
-        # Initialize and start the avatar with error handling
-        avatar_id = os.getenv("BEY_AVATAR_ID")
-        if avatar_id:
-            try:
-                logger.info(f"Initializing BEY avatar with ID: {avatar_id}")
-                avatar = bey.AvatarSession(avatar_id=avatar_id)
-                await avatar.start(session, room=ctx.room)
-                logger.info("BEY avatar started successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize BEY avatar: {e}")
-        else:
-            logger.warning("BEY_AVATAR_ID environment variable not set, skipping avatar initialization")
+        # BEY avatar functionality removed, only transcription sessions are used
         await session.start(
             agent=Transcriber(
                 participant_identity=participant.identity,
                 transcript_collector=self.transcript_data,
-            )
+            ),
+            record=False
         )
         return session
 
     async def _close_session(self, sess: AgentSession):
-        await sess.drain()
+        if not sess:
+            return
+
+        try:
+            await sess.drain()
+        except RuntimeError as e:
+            if "isn't running" not in str(e):
+                raise
+
         await sess.aclose()
 
 async def entrypoint(ctx: JobContext):
@@ -526,16 +557,14 @@ async def entrypoint(ctx: JobContext):
             # Non-RTC errors → re-raise (handled as usual)
             raise
 
-
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
-
 
 async def request_fnc(req: JobRequest):
 
     await req.accept(
-        name="test1",
-        identity="test1",
+        name="note-taker-agent",
+        identity="note-taker-agent",
     )
 
 
@@ -544,8 +573,9 @@ def main():
         entrypoint_fnc=entrypoint,
         request_fnc=request_fnc,
         prewarm_fnc=prewarm,
-        agent_name="test1",
-        port=8092,
+        job_memory_warn_mb=1024,
+        agent_name="note-taker-agent",
+        port=8091,
     )
     cli.run_app(
         opts,
@@ -554,6 +584,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# note-taker-agen
