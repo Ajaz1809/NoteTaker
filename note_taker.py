@@ -29,6 +29,7 @@ from livekit.agents import JobRequest
 from typing import Optional
 import os
 
+ 
 load_dotenv()
 logger = logging.getLogger("transcriber")
 client = OpenAI()
@@ -40,9 +41,9 @@ class Transcriber(Agent):
             model="nova-3",
             language="multi",
             # CRITICAL: Disable interim results so we only get high-confidence final sentences
-            interim_results=True, 
+            interim_results=False, 
             # CRITICAL: Increase endpointing to 1 second so pauses don't break sentences
-            endpointing_ms=100,
+            endpointing_ms=900,
             # CRITICAL: Disable no_delay to allow the AI to use context for better grammar
             no_delay=True,
             punctuate=True,
@@ -78,22 +79,29 @@ class Transcriber(Agent):
         try:
             # We use GPT-4o-mini because it is natively multilingual
             response = await client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system", 
-                        "content": (
-                            "You are a transcript polisher for multilingual meetings. "
-                            "Fix punctuation and spelling for the language provided. "
-                            "DO NOT translate the text. If it is in Hindi, keep it in Hindi. "
-                            "If it is in English, keep it in English. "
-                            "Only fix errors and formatting. Keep it 100% authentic to the speaker's intent."
-                        )
-                    },
-                    {"role": "user", "content": raw_text}
-                ],
-                max_tokens=500,
-                temperature=0
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a transcript polisher for multilingual meetings. "
+                        "Your job is to clean and improve transcripts while preserving the original meaning.\n\n"
+                        "Rules:\n"
+                        "1. Fix punctuation, spelling, and grammar.\n"
+                        "2. Improve sentence structure ONLY if needed for clarity.\n"
+                        "3. DO NOT change the language (Hindi stays Hindi, English stays English).\n"
+                        "4. DO NOT translate.\n"
+                        "5. Preserve the speaker's original intent and tone.\n"
+                        "6. Correct obvious name errors (e.g., misheard or misspelled names) ONLY if context makes it clear.\n"
+                        "7. Do NOT guess names if unsure—keep them as-is.\n"
+                        "8. Keep the transcript natural and conversational, not overly formal.\n"
+                        "9. Do NOT add new information.\n"
+                    )
+                },
+                {"role": "user", "content": raw_text}
+            ],
+            max_tokens=500,
+            temperature=0
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
@@ -404,34 +412,65 @@ class MultiUserTranscriber:
             self.room_ended = True
             asyncio.create_task(self.aclose())
 
+    # async def _start_session(self, participant: rtc.RemoteParticipant) -> AgentSession:
+    #     if participant.identity in self._sessions:
+    #         return self._sessions[participant.identity]
+    #     session = AgentSession(vad=self.ctx.proc.userdata["vad"])
+    #     room_io = RoomIO(
+    #         agent_session=session,
+    #         room=self.ctx.room,
+    #         participant=participant,
+    #         input_options=RoomInputOptions(
+    #             text_enabled=False, close_on_disconnect=False
+    #         ),
+    #         output_options=RoomOutputOptions(
+    #             transcription_enabled=False, audio_enabled=False
+    #         ),
+    #     )
+    #     await room_io.start()
+
+    #     # BEY avatar functionality removed, only transcription sessions are used
+    #     await session.start(
+    #         agent=Transcriber(
+    #             participant_identity=participant.identity,
+    #             transcript_collector=self.transcript_data,
+    #         ),
+    #         record=False
+    #     )
+       
+    #     return session
+    
+   
     async def _start_session(self, participant: rtc.RemoteParticipant) -> AgentSession:
         if participant.identity in self._sessions:
             return self._sessions[participant.identity]
-
         session = AgentSession(vad=self.ctx.proc.userdata["vad"])
         room_io = RoomIO(
             agent_session=session,
             room=self.ctx.room,
             participant=participant,
             input_options=RoomInputOptions(
-                text_enabled=False, close_on_disconnect=False
+                text_enabled=False,
+                close_on_disconnect=False
             ),
             output_options=RoomOutputOptions(
-                transcription_enabled=False, audio_enabled=False
+                transcription_enabled=False,
+                audio_enabled=False
             ),
         )
+
         await room_io.start()
 
-        # BEY avatar functionality removed, only transcription sessions are used
         await session.start(
             agent=Transcriber(
                 participant_identity=participant.identity,
-                transcript_collector=self.transcript_data,
+                transcript_collector=self.transcript_data
             ),
-            record=False
+            room=self.ctx.room
         )
-        return session
 
+        return session
+   
     async def _close_session(self, sess: AgentSession):
         if not sess:
             return

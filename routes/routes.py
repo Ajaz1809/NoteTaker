@@ -100,6 +100,8 @@ from starlette.config import Config
 from utils.custom_voice import validate_voice_id
 import re,logging
 from db.database import engine
+import asyncio
+
 
 logger = logging.getLogger("routes")
 router = APIRouter()
@@ -446,7 +448,7 @@ async def create_room_and_token(
                 status_code=404,
                 detail="No LLM configuration & Agent not found for this user",
             )
-
+        # If agent exists, check if it has a valid LLM configuration
         # 🔥 Step 2: Create room (optional - LiveKit auto-creates)
         lkapi = api.LiveKitAPI(
             url=LIVEKIT_URL, api_key=LIVEKIT_API_KEY, api_secret=LIVEKIT_API_SECRET
@@ -536,32 +538,134 @@ async def create_dispatch(
             }
 
 
+# @router.post("/notetaker-dispatch")
+# async def create_dispatch(
+#     request: DispatchRequest,
+#     db: Session = Depends(get_notetaker_db),
+# ):
+
+#     lkapi = api.LiveKitAPI()
+#     try:
+#         # check if participant already exists
+#         res = await lkapi.room.get_participant(
+#             RoomParticipantIdentity(
+#                 room=request.room_name,
+#                 identity=request.agent_name,
+#             )
+#         )
+#         if res.identity:
+#             # If participant exists, return their identity
+#             return {
+#                 "status": False,
+#                 "message": "Agent already exists",
+#                 "data": res.identity,
+#             }
+#     except Exception as e:
+#         # Handle 'participant does not exist' gracefully
+#         if "participant does not exist" in str(e).lower():
+#             # Check if there's an active call (by call_id == room_name)
+#             existing_call = (
+#                 db.query(NoteTakerCall)
+#                 .filter(
+#                     NoteTakerCall.call_id == request.room_name,
+#                     NoteTakerCall.call_status == "active",
+#                 )
+#                 .first()
+#             )
+
+#             if not existing_call:
+#                 new_call = NoteTakerCall(
+#                     call_id=request.room_name,
+#                     start_timestamp=int(time.time() * 1000),
+#                     meeting_id=request.meeting_id,
+#                     conf_name=request.conf_name,
+#                     user_id=request.user_id,   # NEW
+#                 )
+#                 db.add(new_call)
+#                 db.commit()
+#                 db.refresh(new_call)
+#             else:
+#                 updated = False
+#                 if request.user_id and existing_call.user_id != request.user_id:
+#                     existing_call.user_id = request.user_id
+#                     updated = True
+#                 if request.meeting_id and existing_call.meeting_id != request.meeting_id:
+#                     existing_call.meeting_id = request.meeting_id
+#                     updated = True
+#                 if request.conf_name and existing_call.conf_name != request.conf_name:
+#                     existing_call.conf_name = request.conf_name
+#                     updated = True
+#                 if updated:
+#                     db.add(existing_call)
+#                     db.commit()
+#                     db.refresh(existing_call)
+
+#             # Dispatch the note-taker agent
+#             dispatch = await lkapi.agent_dispatch.create_dispatch(
+#                 api.CreateAgentDispatchRequest(
+#                     agent_name=request.agent_name,
+#                     room=request.room_name,
+#                 )
+#             )
+
+#             return {
+#                 "status": "success",
+#                 "dispatch_id": dispatch.id,
+#                 "room": dispatch.room,
+#                 "agent_name": dispatch.agent_name,
+#             }
+
+#         # For any other error
+#         raise HTTPException(status_code=500, detail=str(e))
+
+import asyncio
+import time
+import traceback
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from livekit import api
+from livekit.api import (
+    RoomParticipantIdentity,
+    ListParticipantsRequest,
+)
+
+
+
 @router.post("/notetaker-dispatch")
 async def create_dispatch(
     request: DispatchRequest,
     db: Session = Depends(get_notetaker_db),
 ):
-
-    lkapi = api.LiveKitAPI()
     try:
-        # check if participant already exists
-        res = await lkapi.room.get_participant(
-            RoomParticipantIdentity(
-                room=request.room_name,
-                identity=request.agent_name,
-            )
-        )
-        if res.identity:
-            # If participant exists, return their identity
-            return {
-                "status": False,
-                "message": "Agent already exists",
-                "data": res.identity,
-            }
-    except Exception as e:
-        # Handle 'participant does not exist' gracefully
-        if "participant does not exist" in str(e).lower():
-            # Check if there's an active call (by call_id == room_name)
+        async with api.LiveKitAPI() as lkapi:
+
+            # -------------------------------
+            # STEP 1: Check if agent already exists
+            # -------------------------------
+            try:
+                res = await lkapi.room.get_participant(
+                    RoomParticipantIdentity(
+                        room=request.room_name,
+                        identity=request.agent_name,
+                    )
+                )
+
+                if res.identity:
+                    return {
+                        "status": False,
+                        "message": "Agent already exists",
+                        "data": res.identity,
+                    }
+
+            except Exception:
+                # Expected if participant does not exist
+                pass
+
+            # -------------------------------
+            # STEP 2: Ensure DB entry
+            # -------------------------------
             existing_call = (
                 db.query(NoteTakerCall)
                 .filter(
@@ -577,28 +681,70 @@ async def create_dispatch(
                     start_timestamp=int(time.time() * 1000),
                     meeting_id=request.meeting_id,
                     conf_name=request.conf_name,
-                    user_id=request.user_id,   # NEW
+                    user_id=request.user_id,
                 )
                 db.add(new_call)
                 db.commit()
                 db.refresh(new_call)
             else:
                 updated = False
+
                 if request.user_id and existing_call.user_id != request.user_id:
                     existing_call.user_id = request.user_id
                     updated = True
+
                 if request.meeting_id and existing_call.meeting_id != request.meeting_id:
                     existing_call.meeting_id = request.meeting_id
                     updated = True
+
                 if request.conf_name and existing_call.conf_name != request.conf_name:
                     existing_call.conf_name = request.conf_name
                     updated = True
+
                 if updated:
                     db.add(existing_call)
                     db.commit()
                     db.refresh(existing_call)
 
-            # Dispatch the note-taker agent
+            # -------------------------------
+            # STEP 3: Wait for REAL participant (CRITICAL FIX)
+            # -------------------------------
+            participants = []
+
+            for i in range(8):
+                try:
+                    res = await lkapi.room.list_participants(
+                        ListParticipantsRequest(room=request.room_name)
+                    )
+
+                    participants = res.participants
+                    print(f"[Retry {i}] Participants count: {len(participants)}")
+
+                    # ✅ KEY FIX
+                    if len(participants) > 0:
+                        print("Room is ACTIVE")
+                        break
+
+                except Exception as e:
+                    print(f"[Retry {i}] Error:", str(e))
+
+                await asyncio.sleep(1)
+
+            else:
+                raise Exception("No participants joined the room")
+
+            # -------------------------------
+            # STEP 4: Stabilization delay
+            # -------------------------------
+            await asyncio.sleep(1)
+
+            print("Dispatching agent...")
+            for p in participants:
+                print("Participant:", p.identity)
+
+            # -------------------------------
+            # STEP 5: Dispatch agent
+            # -------------------------------
             dispatch = await lkapi.agent_dispatch.create_dispatch(
                 api.CreateAgentDispatchRequest(
                     agent_name=request.agent_name,
@@ -613,11 +759,11 @@ async def create_dispatch(
                 "agent_name": dispatch.agent_name,
             }
 
-        # For any other error
+    except Exception as e:
+        print("FINAL ERROR:", str(e))
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
-
-
+    
 @router.get("/notetaker/call-list")
 def get_calls(user_id: Optional[str] = None, db: Session = Depends(get_notetaker_db)):
     try:
