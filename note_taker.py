@@ -1,11 +1,8 @@
 import asyncio, json, re
-import logging, time
-from sqlalchemy import func
+import  time
+import os
 from dotenv import load_dotenv
-from datetime import datetime
 from livekit import rtc
-from tasks import analyze_transcript  # import at top
-from openai._exceptions import APITimeoutError
 from livekit.agents import (
     Agent,
     AgentSession,
@@ -15,7 +12,7 @@ from livekit.agents import (
     RoomInputOptions,
     RoomIO,
     RoomOutputOptions,
-    StopResponse,
+    TurnHandlingOptions,
     WorkerOptions,
     cli,
     llm,
@@ -23,325 +20,268 @@ from livekit.agents import (
 )
 from livekit.plugins import deepgram, silero
 from openai import OpenAI
-from db.database import NoteTakerSessionLocal, ConferenceSessionLocal
-from models.models import NoteTakerCall, ConferenceSummary
 from livekit.agents import JobRequest
 from typing import Optional
+import aio_pika
+import redis
+from logs import logw 
+import random
+
+
+
+def uniqueID():
+    timestamp = int(time.time() * 1000)
+    random_part = random.randint(1000, 9999)
+    return f"Unique ID: {timestamp}.{random_part}"
+    
+# Redis connection
+redis_client = redis.Redis(
+    host=os.getenv("REDIS_HOST", "localhost"),
+    port=int(os.getenv("REDIS_PORT", 6379)),
+    password=os.getenv("REDIS_PASSWORD", ""),
+    decode_responses=True
+)
+
 
 load_dotenv()
-
-logger = logging.getLogger("transcriber")
+# logger = logging.getLogger("transcriber")
 client = OpenAI()
 
-
 class Transcriber(Agent):
-    def __init__(self, *, participant_identity: str, transcript_collector: list):
-        try:
-            stt_engine = deepgram.STT(
-                model="nova-3",
-                language="multi",
-                interim_results=True,
-                punctuate=True,
-                smart_format=True,
-                numerals=True,
-                sample_rate=16000,
-                no_delay=True,
-                endpointing_ms=25,
-                filler_words=True,
-                profanity_filter=False,
-                mip_opt_out=True,
-            )
-        except Exception as e:
-            logger.error(f"❌ Failed to init Deepgram STT: {e}")
-            # Fallback: Disable STT, still run Agent
-            stt_engine = None
-            self.stt_error = str(e)
-        else:
-            self.stt_error = None
-
-        super().__init__(instructions="not-needed", stt=stt_engine)
+    def __init__(self, *, participant_identity: str, transcript_collector: list,room_name: str,meeting_start_time_ms: int):
+        stt_engine = None
+        retry_count = 0
+        max_retries = 3
+        self.meeting_start_time_ms = meeting_start_time_ms
+        while stt_engine is None and retry_count < max_retries:
+            try:
+                stt_engine = deepgram.STT(
+                    model="nova-3",
+                    language="multi",
+                    interim_results=True,
+                    endpointing_ms=400,
+                    no_delay=True,
+                    punctuate=True,
+                    smart_format=True,
+                    numerals=True,
+                    sample_rate=16000,
+                    filler_words=False,
+                    profanity_filter=False,
+                    mip_opt_out=True,
+                )
+            except Exception as e:
+                retry_count += 1
+                logw("error", f" Failed to init Deepgram STT (attempt {retry_count}/{max_retries}): {e}\n")
+                if retry_count < max_retries:
+                    time.sleep(1)  # Wait before retrying
+                else:
+                    stt_engine = None
+                    
+        if stt_engine is None:
+            logw("error", " Could not initialize STT after all retries\n")
+            # Fallback: use a simple STT or raise
+            
+        super().__init__(instructions="Silent observer", stt=stt_engine)
         self.participant_identity = participant_identity
         self.transcript_collector = transcript_collector
-
-    async def on_user_turn_completed(
-        self, chat_ctx: llm.ChatContext, new_message: llm.ChatMessage
-    ):
+        self.room_name = room_name
+        
+        
+    async def on_user_turn_completed(self, chat_ctx: llm.ChatContext, new_message: llm.ChatMessage):
+        # Check if this callback is outdated (newer user input detected)
+        if self._is_outdated():
+            logw("info", f"Skipping outdated turn for {self.participant_identity}")
+            return
+            
         try:
             user_transcript = new_message.text_content
-            timestamp = int(time.time() * 1000)
-            logger.info(
-                f"{self.participant_identity} -> {user_transcript} at {timestamp}"
-            )
+            if not user_transcript:
+                return
+                
+            current_time_ms = int(time.time() * 1000)
+            timestamp = current_time_ms - self.meeting_start_time_ms
+            
+            logw("info", f"Transcript from {self.participant_identity} at + {timestamp}ms: {user_transcript}\n")
             self.transcript_collector.append(
                 f"{self.participant_identity}: {user_transcript} : {timestamp}"
             )
+            
+            # flag_key = f"transcription:active:{self.room_name}"
+            # redis_client.setex(flag_key, 120, "1")
+            # logw("info", f" Redis: [{flag_key}] = 1 | Transcription detected!\n")
         except Exception as e:
-            logger.error(f"⚠️ Error during transcript collection: {e}")
-            self.transcript_collector.append(f"ERROR: {str(e)}")
-        finally:
-            raise StopResponse()
+            logw("error", f" Error during transcript collection: {e}\n")
 
+    def _is_outdated(self) -> bool:
+        """Check if this callback is from an outdated user turn"""
+        activity = getattr(self, '_get_activity_or_raise', None)
+        if activity:
+            try:
+                activity_obj = activity()
+                current_task = asyncio.current_task()
+                user_turn_task = getattr(activity_obj, '_user_turn_completed_atask', None)
+                if user_turn_task and user_turn_task != current_task:
+                    return True
+            except Exception as e:
+                logw("error", f"Error in _is_outdated: {e}")
+                pass
+        return False
 
+ 
 class MultiUserTranscriber:
-    def __init__(self, ctx: JobContext, existing_call_id: Optional[str] = None):
+    def __init__(self, ctx: JobContext, meeting_metadata: Optional[dict] = None):
+        self.room_name = ctx.room.name if ctx.room else "unknown"
         self.ctx = ctx
         self._sessions: dict[str, AgentSession] = {}
         self._tasks: set[asyncio.Task] = set()
         self.transcript_data: list[str] = []
         self.participants_remaining: set[str] = set()
-        self.note_call_id = existing_call_id
-        self.room_ended = False  # track whether the room actually ended
-        self.retry_mode = False  # 👈 new: when True, this was an RTC crash / retry
+        # NEW: Track all participants who ever joined (including those who left)
+        self.all_participants: set[str] = set()
+        self.room_ended = False
+        self.retry_mode = False
+        self._is_shutting_down = False
+        self._published = False
+        self.start_time_ms = int(time.time() * 1000)
+        self.meeting_start_time_ms = self.start_time_ms
+        # Store meeting metadata for RabbitMQ
+        self.meeting_metadata = meeting_metadata or {}
+        self.meeting_id = self.meeting_metadata.get("meeting_id", "N/A")
+        self.user_id = self.meeting_metadata.get("user_id", "N/A")
+        self.conf_name = self.meeting_metadata.get("conf_name", "N/A")
+        logw("info", f" Initialized with Meeting ID: {self.meeting_id}  || User ID: {self.user_id} || Conference: {self.conf_name}\n")
 
     def set_retry_mode(self):
-        """
-        Called from entrypoint when we detect a critical RTC error and plan to rejoin.
-        In this mode, aclose() MUST NOT mark the call as ended or start analysis.
-        """
+        """Called when we detect RTC error and plan to rejoin."""
         self.retry_mode = True
 
     def start(self):
         self.ctx.room.on("participant_connected", self.on_participant_connected)
         self.ctx.room.on("participant_disconnected", self.on_participant_disconnected)
-        # listen for room-level disconnect (room destroyed / closed)
         self.ctx.room.on("disconnected", self.on_room_disconnected)
 
-    async def aclose(self):
-        # Cancel running tasks and close sessions
-        await utils.aio.cancel_and_wait(*self._tasks)
-        await asyncio.gather(
-            *[self._close_session(session) for session in self._sessions.values()]
-        )
+    async def publish_to_rabbitmq(self):
+        """Publish final transcript to RabbitMQ"""
+        if self._published or not self.transcript_data:
+            logw("info", "Skipping publish: No data or already published.")
+            return False
+        
+        try:
+            # Connect to RabbitMQ
+            connection = await aio_pika.connect_robust(
+                host=os.getenv("RABBITMQ_HOST", "rabbitmq.webvio.in"),
+                port=int(os.getenv("RABBITMQ_PORT", 5672)),
+                login=os.getenv("RABBITMQ_USERNAME", "AjazDev"),
+                password=os.getenv("RABBITMQ_PASSWORD", "Dev@123"),
+                timeout=10
+            )
 
-        # Remove room event listeners
+            async with connection:
+                channel = await connection.channel()
+                # Declare queue (durable so messages survive broker restart)
+                await channel.declare_queue("final.transcripts", durable=True)
+                end_time_ms = int(time.time() * 1000)
+                message_payload = {
+                    "meeting_id": self.meeting_id,
+                    "user_id": self.user_id,
+                    "conf_name": self.conf_name,
+                    "room_name": self.room_name,
+                    "transcript": self.transcript_data,
+                    "timestamp": end_time_ms,
+                    "duration_ms": max(0, end_time_ms - self.start_time_ms),
+                    "remaining_participants_count": len(self.participants_remaining),
+                    # I want to give the list all pariticipants count in the who joined the call , make sure participants not repeated .
+                    "all_participants_count": len(list(self.all_participants)),
+                    "participants_list": list(self.all_participants),
+                    
+                    
+                    "status": "ended" if self.room_ended else "active"
+                }                   
+                   
+
+                # Publish message
+                await channel.default_exchange.publish(
+                    aio_pika.Message(
+                        body=json.dumps(message_payload).encode(),
+                        delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                        content_type='application/json'
+                    ),
+                    routing_key="final.transcripts",
+                )
+                
+            self._published = True
+            logw("info", f"->>> Published meeting {self.meeting_id} to RabbitMQ with {len(self.transcript_data)} transcript entries")
+            return True
+        except Exception as e:
+            logw("error", f" RabbitMQ publish error: {e}")
+            return False
+
+    async def aclose(self):
+        """Clean shutdown with RabbitMQ publish"""
+        if self._is_shutting_down:
+            return
+
+        self._is_shutting_down = True
+        logw("info", "Closing room and cleaning up sessions...")
+
+        # Wait for pending transcripts if participants are still active
+        if self._sessions and not self.retry_mode:
+            logw("info", f"⏳ Waiting for {len(self._sessions)} active sessions to complete...")
+            await asyncio.sleep(1.0)  # Wait for final transcripts
+            await asyncio.sleep(0)    # Process pending callbacks
+
+        # Cancel running tasks
+        try:
+            if self._tasks:
+                await utils.aio.cancel_and_wait(*self._tasks)
+        except Exception as e:
+            logw("error", f"Task cancellation failed: {e}")
+
+        # Close all sessions
+        try:
+            sessions = list(self._sessions.values())
+            results = await asyncio.gather(
+                *(self._close_session(s) for s in sessions),
+                return_exceptions=True
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    logw("error", f" Session close failed: {result}")
+        except Exception as e:
+            logw("error", f" Error during session cleanup: {e}")
+
+        # Extra buffer for last-moment transcripts
+        if self._sessions and not self.retry_mode:
+            await asyncio.sleep(0.5)
+
+        # Publish to RabbitMQ (only once)
+        if not self._published and not self.retry_mode:
+            await self.publish_to_rabbitmq()
+        elif self.retry_mode:
+            logw("info", "Retry mode: Skipping final publish, will continue in new session")
+        else:
+            logw("info", "Transcript already published")
+
+        # Remove event listeners
         self.ctx.room.off("participant_connected", self.on_participant_connected)
         self.ctx.room.off("participant_disconnected", self.on_participant_disconnected)
-        # detach the room disconnected handler
         self.ctx.room.off("disconnected", self.on_room_disconnected)
-
-        end_call_time = int(time.time() * 1000)
-        error_msg = None
-
-        if not self.room_ended:
-            try:
-                if not self.ctx.room.remote_participants:
-                    logger.info(
-                        "🏁 No remote participants at shutdown; inferring room has ended."
-                    )
-                    self.room_ended = True
-            except Exception:
-                # If anything goes wrong reading remote_participants, don't crash saving.
-                logger.warning(
-                    "⚠️ Could not inspect remote_participants; leaving room_ended as-is."
-                )
-
-        try:
-            # ✅ Only save if transcripts exist
-            if self.transcript_data:
-                new_transcript_entry = list(map(str, self.transcript_data))
-
-                db = NoteTakerSessionLocal()
-                try:
-                    # 1. Fetch by stored ID or search for an ACTIVE one if ID is missing
-                    note_call = None
-                    if self.note_call_id:
-                        note_call = (
-                            db.query(NoteTakerCall)
-                            .filter_by(id=self.note_call_id)
-                            .first()
-                        )
-                        if not note_call:
-                            note_call = (
-                                db.query(NoteTakerCall)
-                                .filter_by(
-                                    call_id=self.ctx.room.name, call_status="active"
-                                )
-                                .order_by(NoteTakerCall.start_timestamp.desc())
-                                .first()
-                            )
-                    else:
-                        note_call = (
-                            db.query(NoteTakerCall)
-                            .filter_by(call_id=self.ctx.room.name, call_status="active")
-                            .order_by(NoteTakerCall.start_timestamp.desc())
-                            .first()
-                        )
-
-                    # SPECIAL CASE: RETRY MODE (RTC ERROR REJOIN)
-                    if self.retry_mode and note_call:
-                        # just append transcripts and keep call ACTIVE, no ending, no analysis
-                        if note_call.call_analysis is None:
-                            note_call.call_analysis = {
-                                "status": "initializing",
-                                "transcript_dict": [],
-                            }
-
-                        existing_transcripts = note_call.call_analysis.get(
-                            "transcript_dict", []
-                        )
-                        existing_transcripts.extend(new_transcript_entry)
-
-                        note_call.call_analysis = {
-                            "status": "pending",
-                            "transcript_dict": existing_transcripts,
-                        }
-
-                        # Ensure it stays active (meeting still ongoing)
-                        note_call.call_status = "active"
-                        note_call.updated_at = end_call_time
-
-                        db.commit()
-                        self.note_call_id = note_call.id
-                        logger.info(
-                            f"✅ [RETRY MODE] Buffered transcript flushed to DB (id={self.note_call_id}) "
-                            f"for room '{self.ctx.room.name}', keeping call ACTIVE."
-                        )
-                        return  # do NOT fall through to normal end/analysis logic
-
-                    if note_call:
-                        # Append new transcript lines
-                        if note_call.call_analysis is None:
-                            note_call.call_analysis = {
-                                "status": "initializing",
-                                "transcript_dict": [],
-                            }
-
-                        existing_transcripts = note_call.call_analysis.get(
-                            "transcript_dict", []
-                        )
-                        existing_transcripts.extend(new_transcript_entry)
-
-                        note_call.call_analysis = {
-                            "status": "pending",
-                            "transcript_dict": existing_transcripts,
-                        }
-
-                        # 🔚 IMPORTANT:
-                        # Any non-retry aclose() means this note-taker session is finished.
-                        # Mark the call as ENDED, regardless of room_ended / LiveKit state.
-                        note_call.call_status = "ended"
-                        note_call.end_timestamp = end_call_time
-
-                        start_ts = note_call.start_timestamp or end_call_time
-                        duration = end_call_time - start_ts
-                        if duration < 0:
-                            logger.warning(
-                                f"⚠️ Negative duration detected: {duration}ms. Setting to 0."
-                            )
-                            duration = 0
-                        note_call.duration_ms = duration
-
-                        # always bump updated_at so we know this is the most recent row
-                        note_call.updated_at = end_call_time
-
-                        db.commit()
-                        self.note_call_id = note_call.id
-                        logger.info(
-                            f"✅ Raw transcript UPDATED to DB (id={self.note_call_id}) for room '{self.ctx.room.name}'"
-                        )
-                        
-                    else:
-                        # 3. Create a new entry if none found
-                        status = "ended" # if self.room_ended else "active"
-                        start_ts = end_call_time
-                        end_ts = end_call_time if self.room_ended else None
-                        duration = end_call_time - start_ts if self.room_ended else 0
-
-                        note_call = NoteTakerCall(
-                            call_id=self.ctx.room.name,
-                            start_timestamp=start_ts,
-                            end_timestamp=end_ts,
-                            duration_ms=duration,
-                            call_status=status,
-                            call_analysis={
-                                "status": "pending",
-                                "transcript_dict": new_transcript_entry,
-                            },
-                            updated_at=end_call_time,
-                        )
-                        db.add(note_call)
-                        db.commit()
-                        self.note_call_id = note_call.id
-                        logger.info(
-                            f"✅ Raw transcript CREATED in DB (id={self.note_call_id}) for room '{self.ctx.room.name}'"
-                        )
-
-                finally:
-                    db.close()
-
-                # analyze when this is a REAL end, not an RTC retry
-                if self.note_call_id and not self.retry_mode:
-                    logger.info(
-                        f"🧠 Note-taker session ended, kicking off analysis for id={self.note_call_id}"
-                    )
-                    analyze_transcript.delay(self.note_call_id)
-                else:
-                    logger.info(
-                        "ℹ️ Retry mode / non-final end; skipping analysis for now."
-                    )
-
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"❌ Error during aclose: {error_msg}")
-
-            db = NoteTakerSessionLocal()
-            try:
-                note_call = None
-                if self.note_call_id:
-                    note_call = (
-                        db.query(NoteTakerCall).filter_by(id=self.note_call_id).first()
-                    )
-                if not note_call:
-                    note_call = (
-                        db.query(NoteTakerCall)
-                        .filter_by(call_id=self.ctx.room.name)
-                        .order_by(NoteTakerCall.start_timestamp.desc())
-                        .first()
-                    )
-
-                if note_call:
-                    if self.room_ended:
-                        note_call.call_status = "ended"
-                        note_call.end_timestamp = end_call_time
-                    else:
-                        note_call.call_status = "error"
-
-                    note_call.call_analysis = {
-                        "status": "error",
-                        "summary": error_msg,
-                        "transcript_dict": list(map(str, self.transcript_data)),
-                    }
-                    if self.room_ended and note_call.start_timestamp:
-                        note_call.duration_ms = (
-                            end_call_time - note_call.start_timestamp
-                        )
-
-                    note_call.updated_at = end_call_time  # 👈 added
-
-                    db.commit()
-                    logger.info(
-                        f"⚠️ Error details saved in DB for call id={note_call.id}"
-                    )
-                else:
-                    logger.warning(
-                        f"⚠️ No NoteTakerCall found to log error for room '{self.ctx.room.name}'"
-                    )
-            finally:
-                db.close()
-
-    # event handlers
+         # DELETE Redis flag when agent leaves room
+        flag_key = f"transcription:active:{self.room_name}"
+        redis_client.delete(flag_key)
+        logw("info", f"Redis deleted: [{flag_key}]")
 
     def on_room_disconnected(self, *args, **kwargs):
-        # Fired when LiveKit disconnects this room (e.g. explicitly closed).
-        logger.info("🏁 Room 'disconnected' event received; marking room as ended.")
+        logw("info", "Room 'disconnected' event received")
         self.room_ended = True
 
     def on_participant_connected(self, participant: rtc.RemoteParticipant):
         if participant.identity in self._sessions:
             return
 
-        logger.info(f"🟢 Connected: {participant.identity}")
+        logw("info", f" Connected: {participant.identity}")
         self.participants_remaining.add(participant.identity)
+        self.all_participants.add(participant.identity)
         task = asyncio.create_task(self._start_session(participant))
         self._tasks.add(task)
 
@@ -354,18 +294,19 @@ class MultiUserTranscriber:
         task.add_done_callback(on_task_done)
 
     def on_participant_disconnected(self, participant: rtc.RemoteParticipant):
-        if (session := self._sessions.pop(participant.identity)) is None:
+        session = self._sessions.pop(participant.identity, None)
+        if session is None:
             return
 
-        logger.info(f"🔴 Disconnected: {participant.identity}")
+        logw("info", f"<> Disconnected <>: {participant.identity}")
         self.participants_remaining.discard(participant.identity)
         task = asyncio.create_task(self._close_session(session))
         self._tasks.add(task)
         task.add_done_callback(lambda _: self._tasks.discard(task))
 
-        # If everyone disconnected, shutdown and mark room as ended
+        # If everyone left, end the session
         if not self.participants_remaining:
-            logger.info("👋 All participants left, marking room as ended.")
+            logw("info", " All participants left, ending session.")
             self.room_ended = True
             asyncio.create_task(self.aclose())
 
@@ -373,7 +314,13 @@ class MultiUserTranscriber:
         if participant.identity in self._sessions:
             return self._sessions[participant.identity]
 
-        session = AgentSession(vad=self.ctx.proc.userdata["vad"])
+        session = AgentSession(
+            vad=self.ctx.proc.userdata["vad"],
+            turn_handling=TurnHandlingOptions(
+                interruption={"mode": "vad"}  # ← ADD THIS
+            )
+        )
+    
         room_io = RoomIO(
             agent_session=session,
             room=self.ctx.room,
@@ -386,174 +333,138 @@ class MultiUserTranscriber:
             ),
         )
         await room_io.start()
-
-        from livekit.plugins import bey
-
-        # Initialize and start the avatar with error handling
-        avatar_id = os.getenv("BEY_AVATAR_ID")
-        if avatar_id:
-            try:
-                logger.info(f"Initializing BEY avatar with ID: {avatar_id}")
-                avatar = bey.AvatarSession(avatar_id=avatar_id)
-                await avatar.start(session, room=ctx.room)
-                logger.info("BEY avatar started successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize BEY avatar: {e}")
-        else:
-            logger.warning("BEY_AVATAR_ID environment variable not set, skipping avatar initialization")
         await session.start(
             agent=Transcriber(
                 participant_identity=participant.identity,
                 transcript_collector=self.transcript_data,
-            )
+                room_name=self.room_name,
+                meeting_start_time_ms=self.meeting_start_time_ms,
+            ),
+            record=False
         )
         return session
 
     async def _close_session(self, sess: AgentSession):
-        await sess.drain()
+        if not sess:
+            return
+
+        try:
+            await asyncio.wait_for(sess.drain(), timeout=5.0)
+            await asyncio.sleep(0.1)
+        except (RuntimeError, asyncio.TimeoutError) as e:
+            logw("warning", f"Session drain timeout/error: {e}")
+            await asyncio.sleep(0)
+
         await sess.aclose()
 
 async def entrypoint(ctx: JobContext):
     """
-    Note-taker entrypoint with automatic RTC error retry.
-
-    Behavior:
-    - On startup, find/create NoteTakerCall row for this room and keep its ID.
-    - If we hit a known RTC error (Subscriber pc state failed / rtc_session),
-      we flush buffer to DB WITHOUT ending the call, disconnect, and rejoin
-      the SAME room with the SAME NoteTakerCall.id.
+    Note-taker with RabbitMQ only (no database)
     """
-
     max_retries = 3
     retry_count = 0
-
-    # 1. Find/create persistent call
-    persistent_call_id: Optional[str] = None
-    db = NoteTakerSessionLocal()
+    flag_key = None
+    transcription_happened = False 
+    # Parse metadata from job
+    meeting_metadata = {}
     try:
-        # Pick the latest resumable call for this room (active/error),
-        # or create a new one if none found.
-        note_call = (
-            db.query(NoteTakerCall)
-            .filter(
-                NoteTakerCall.call_id == ctx.room.name,
-                NoteTakerCall.call_status.in_(["active", "error"]),
-            )
-            .order_by(NoteTakerCall.updated_at.desc())
-            .first()
-        )
+        if ctx.job.metadata:
+            raw_metadata = ctx.job.metadata
+            metadata = json.loads(raw_metadata)
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            meeting_metadata = metadata
+            logw("info", f" Meeting metadata: {meeting_metadata}")
+    except Exception as e:
+        logw("warning", f"Could not parse metadata: {e}")
 
-        now_ms = int(time.time() * 1000)
-
-        if note_call:
-            persistent_call_id = note_call.id
-            logger.info(
-                f"🔄 Rejoining existing call session in DB with ID: {persistent_call_id} "
-                f"(prev_status={note_call.call_status})"
-            )
-            note_call.call_status = "active"
-            note_call.end_timestamp = None
-            note_call.duration_ms = 0
-            note_call.updated_at = now_ms
-            db.commit()
-        else:
-            new_call = NoteTakerCall(
-                call_id=ctx.room.name,
-                start_timestamp=now_ms,
-                end_timestamp=None,
-                call_status="active",
-                duration_ms=0,
-                call_analysis={"status": "initializing", "transcript_dict": []},
-                updated_at=now_ms,
-            )
-            db.add(new_call)
-            db.commit()
-            persistent_call_id = new_call.id
-            logger.info(
-                f"✨ Created NEW call session in DB with ID: {persistent_call_id}"
-            )
-    finally:
-        db.close()
-
-    # 2. Retry loop
     while True:
-        transcriber = MultiUserTranscriber(ctx, existing_call_id=persistent_call_id)
+        transcriber = MultiUserTranscriber(ctx, meeting_metadata=meeting_metadata)
         transcriber.start()
 
         try:
             await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+            logw("info", f" Connected to room: {ctx.room.name}")
+            
+             #### SET INITIAL FLAG - Agent room mein hai
+            room_name = ctx.room.name
+            flag_key = f"transcription:active:{room_name}"
+            redis_client.setex(flag_key, 60, "1")  # 0 = room mein hai but abhi transcribe nahi kiya
+            logw("info", f"🔴 Redis initial flag: {flag_key} = 1")
+            
             # Connect to already-present participants
             for participant in ctx.room.remote_participants.values():
-                transcriber.on_participant_connected(participant)
+                if "note-taker" not in participant.identity.lower():
+                    logw("info", f"👤 Connecting: {participant.identity}")
+                    transcriber.on_participant_connected(participant)
 
-            ctx.add_shutdown_callback(lambda: transcriber.aclose())
+            ctx.add_shutdown_callback(lambda: asyncio.create_task(transcriber.aclose()))
 
-            # Normal path: just return when LiveKit ends the job
+            # Wait until room ends
+            while not transcriber.room_ended:
+                await asyncio.sleep(1)
+            
+            # Normal exit
+            await transcriber.aclose()
             return
 
         except Exception as e:
             error_str = str(e)
-
-            # 3. ERROR VALIDATION
+            logw("error", f"Error in main loop: {error_str}")
+            
+            # Handle RTC errors with retry
             if "Subscriber pc state failed" in error_str or "rtc_session" in error_str:
-                logger.error(f"🚨 CRITICAL RTC ERROR DETECTED: {error_str}")
-                logger.info("♻️ Validated RTC error. Initiating REJOIN sequence...")
+                logw("error", f" CRITICAL RTC ERROR: {error_str}")
+                logw("info", " Initiating REJOIN sequence...")
 
                 try:
-                    # Tell transcriber NOT to end/close the DB call, just flush transcripts
                     transcriber.set_retry_mode()
                     await transcriber.aclose()
                 except Exception as e2:
-                    logger.error(
-                        f"⚠️ Error while flushing transcripts in retry mode: {e2}"
-                    )
+                    logw("error", f"Error flushing transcripts: {e2}")
 
-                # Try to disconnect cleanly to reset SDK state
                 try:
                     await ctx.disconnect()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logw("error", f"Error during disconnect, may already be disconnected: {e}")
 
                 retry_count += 1
                 if retry_count > max_retries:
-                    logger.error("❌ Max RTC retries reached. Giving up.")
-                    raise  # bubble up to worker
+                    logw("error", " Max retries reached. Giving up.")
+                    raise
 
-                logger.info(f"🔁 Retry {retry_count}/{max_retries} in 2s...")
-                await asyncio.sleep(2)  # async cooldown
-                continue  # 🔄 RESTART LOOP with SAME persistent_call_id
-
-            # Non-RTC errors → re-raise (handled as usual)
+                logw("info", f" Retry {retry_count}/{max_retries} in 2s...")
+                await asyncio.sleep(2)
+                continue
+            
+            # Non-RTC errors
+            logw("error", f" Non-retryable error: {error_str}")
+            await transcriber.aclose()
             raise
-
+        finally:
+            #  DELETE FLAG when agent exits
+            if flag_key and not transcription_happened:
+                redis_client.delete(flag_key)
+                logw("info", f" Redis deleted (no transcription): [{flag_key}]")
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
-
 async def request_fnc(req: JobRequest):
-
-    await req.accept(
-        name="test1",
-        identity="test1",
-    )
-
+    await req.accept(name="agent-note-taker", identity=f"note-taker-{req.room.name}")
 
 def main():
     opts = WorkerOptions(
         entrypoint_fnc=entrypoint,
         request_fnc=request_fnc,
         prewarm_fnc=prewarm,
-        agent_name="test1",
-        port=8092,
+        job_memory_warn_mb=2048,
+        job_memory_limit_mb=3072,
+        agent_name="note-taker-agent",
+        num_idle_processes=1,
+        port=8091,
     )
-    cli.run_app(
-        opts,
-    )
-
+    cli.run_app(opts)
 
 if __name__ == "__main__":
     main()
-
-
-# note-taker-agen
