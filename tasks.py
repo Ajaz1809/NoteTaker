@@ -12,12 +12,12 @@ logger = logging.getLogger("tasks")
 client = OpenAI()
 
 # ----------------- CONFIG -----------------
-MODEL_FAST = "gpt-4o-mini"     # for chunk analysis (fast + cheap)
-MODEL_FINAL = "gpt-4o"         # for final merge (high quality)
+MODEL_FAST = "gpt-5.4-mini"     # for chunk analysis (fast + cheap)
+MODEL_FINAL = "gpt-5.4-mini"         # for final merge (high quality)
 MODEL_MAX_TOKENS = 25000
-CHUNK_TOKEN_LIMIT = 1000       # <<< REDUCED FROM 10000 -> 1000 as requested
+CHUNK_TOKEN_LIMIT = 1500       # <<< FURTHER REDUCED from 2000 to avoid large merge context
 SAFETY_MARGIN_TOKENS = 500
-MAX_PARALLEL_CHUNKS = 3         # send 3 requests at once
+MAX_PARALLEL_CHUNKS = 5        # send 5 parallel requests for faster processing
 
 # ----------------- TOKEN COUNTER -----------------
 def get_token_counter(model_name: str):
@@ -59,94 +59,608 @@ async def chat_completion(model: str, prompt: str) -> str:
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.3,
-                response_format={"type": "json_object"},  # ✅ enforce JSON output
+                max_completion_tokens=MODEL_MAX_TOKENS,
+                response_format={"type": "json_object"},  #  enforce JSON output
             ),
         )
 
         # Extract content
         content = response.choices[0].message.content
+        if isinstance(content, dict):
+            content = json.dumps(content, ensure_ascii=False)
         if not content:
-            logger.warning("⚠️ Empty response from model")
+            logger.warning(" Empty response from model")
             return ""
 
         return content  # let caller parse JSON
 
     except Exception as e:
-        logger.exception(f"❌ Chat completion request failed: {e}")
+        error_str = str(e)
+        # Check for context length exceeded error
+        if "context_length_exceeded" in error_str or "maximum context length" in error_str:
+            logger.exception(
+                f" Context length exceeded. Prompt is too long. "
+                f"Consider reducing chunk size or using hierarchical merging. Error: {e}"
+            )
+        else:
+            logger.exception(f" Chat completion request failed: {e}")
         return ""
 
-async def analyze_chunk(chunk_text: str) -> dict:
+def _coerce_list(value):
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        return [value]
+    return []
+
+
+def _safe_text(value):
+    if isinstance(value, str):
+        return value.strip()
+    return ""
+
+
+async def analyze_chunk(chunk_text: str, all_participants_count: int, participants_list: list) -> dict:
+    
     """Analyze one chunk using gpt-4o-mini."""
     user_prompt = f"""
-    You are an intelligent meeting assistant.
-    Analyze the following transcript chunk and return a JSON object.
+    You are an expert AI meeting assistant.  
+    Your only source of truth is the transcript below.  
+    Do not invent, assume, or generalize information not explicitly stated or strongly implied.
 
-    Transcript chunk:
+    **IMPORTANT - Product Names (USE EXACTLY THESE):**
+    - Allowed products: AngelPBX, AngelEcho, AngelGo, AngelMeet, AngelTeam
+    - If transcript mentions any product-related word (e.g., "PBX", "echo", "go", "meet", "team"), map it to the correct product name from the list above
+    - If no product from the list matches, leave as-is (do not invent)
+
+    Transcript:
     {chunk_text}
 
-    JSON schema:
-    - summary: one paragraph summary
-    - purpose: meeting goal
-    - key_points: list of points
-    - users_tasks: map of ALL users mentioned in the transcript to their tasks.
-      * If a user has no clear task, include them with ["no task"]
-    - next_steps: actionable follow-ups
-    - transcript_dict: transcript lines (exactly as given)
+    ---
+
+    ## STRICT RULES
+
+    ### 0. No Hallucination
+    - Every output must be directly traceable to the transcript.
+    - If something is not stated or strongly implied in the transcript → do not include it.
+    - Do not guess names, deadlines, priorities, or outcomes unless they appear explicitly.
+
+    ### 1. No Repetition Across Sections
+    - Each piece of information can appear in **only one** section.
+    - If an insight is already in `key_takeaways`, do NOT repeat it in `decisions`, `topics`, or `next_steps`.
+    - If a decision is finalized → put it in `decisions`, not in `topics` or `takeaways`.
+    - If an action item exists → do NOT duplicate it in `next_steps`.
+
+    ### 2. Meeting Purpose
+    - One sentence, unambiguous.
+    - Answer: why the meeting happened + what outcome was expected.
+    - Avoid: "discussion", "catch-up", "sync".
+
+    ### 3. Key Takeaways (3–5 max)
+    - Unique, high-level insights only.
+    - Must not appear elsewhere (decisions, topics, blockers, next steps).
+
+    ### 4. Decisions
+    - Only finalized, high-impact decisions.
+    - Remove any decision that is also a takeaway or topic outcome.
+
+    ### 5. Topics
+    - Group by meaningful business topic.
+    - Each topic = separate problem/solution.
+    - Do not repeat content from takeaways or decisions.
+    - **For product-related topics**: Use exact product names from the allowed list (AngelPBX, AngelEcho, AngelGo, AngelMeet, AngelTeam)
+
+    Each topic:
+    - `title`: specific, outcome-focused (use correct product names if applicable)
+    - `problem`: what was discussed (include person/team only if named)
+    - `solution`: conclusion reached (use correct product names)
+    - `rationale`: why that solution was chosen (stated in transcript)
+    - `postponed_items`: only if explicitly postponed
+
+    ### 6. Action Items (IMPORTANT RULE)
+    **You have the all participants lis {participants_list} , mentioned all update into action item do not missed any one to update into action item if they have any task to do , and make sure every participant appear once in action item if they have task to do .**
+    - Group tasks by owner
+    - Each owner must appear ONLY ONCE
+    - If multiple tasks exist for the same owner, combine them into a single entry
+    - Task field should clearly summarize all responsibilities
+    - Avoid duplicate or fragmented tasks
+    - Assign priority if explicitly mentioned:
+        - high → urgent, blockers, critical path
+        - medium → important but not urgent
+        - low → minor or optional
+    - Keep deadline if explicitly mentioned
+    -  **Before final output, verify: every transcript participant appears exactly once**.
+    
+    
+
+    ### 7. Blockers
+    - Only explicit blockers that impact delivery/timelines.
+    - No minor or resolved issues.
+
+    ### 8. Next Steps (Critical Format)
+    - Maximum 5–6 items.
+    - **Format** (exact): `"Name: Action with timeline if mentioned"`
+    - Do NOT repeat action items.
+    - Only forward-looking, project-level steps.
+    - If no person is named, infer minimally (only if obvious).
+    - **If action mentions a product**: Use exact name from allowed list
+
+    Example:  
+    `"Nisha: Schedule extended DSU for tomorrow morning to discuss AngelPBX integration"`
+
+    ### 9. Meeting Tone
+    - 2–4 short, insightful observations.
+    - From transcript tone, not imagined.
+
+    ### 10. Transcript Highlights (Cleaned)
+    - 3–5 impactful, rephrased statements.
+    - Include speaker attribution.
+    - Focus on commitments, risks, or key statements.
+    - Do not duplicate other sections.
+    - **Use correct product names** when mentioned
+
+    ---
+
+    ## PRODUCT NAME MAPPING REFERENCE:
+    | If transcript says | Use this in output |
+    |-------------------|-------------------|
+    | PBX, Angel PBX, angelpbx | AngelPBX |
+    | echo, angel echo | AngelEcho |
+    | go, angel go, GO | AngelGo |
+    | meet, meeting, angel meet | AngelMeet |
+    | team, angel team | AngelTeam |
+    | Any other product term with "angel" prefix | Keep as-is but capitalize properly |
+
+    ---
+
+    ## OUTPUT JSON (only valid JSON, no extra text)
+
+    {{
+    "meeting_purpose": "string",
+    "key_takeaways": ["..."],
+    "decisions": ["..."],
+    "topics": [
+        {{
+        "title": "string",
+        "problem": "string or null",
+        "solution": "string",
+        "rationale": "string",
+        "postponed_items": ["..."]
+        }}
+    ],
+    "action_items": [
+        {{
+        "owner": "string",
+        "task": "string",
+        "priority": "high | medium | low | null",
+        "deadline": "string or null"
+        }}
+    ],
+    "blockers": ["..."],
+    "next_steps": ["..."],
+    "meeting_tone": ["..."],
+    "transcript_highlights": ["..."]
+    }}
     """
     content = await chat_completion(MODEL_FAST, user_prompt)
+    logger.info(f" AI response for chunk: {content[:500]}...")
+    if not content:
+        logger.warning("Empty response for chunk analysis")
+        return {
+            "meeting_purpose": "",
+            "key_takeaways": [],
+            "decisions": [],
+            "topics": [],
+            "action_items": [],
+            "blockers": [],
+            "next_steps": [],
+            "meeting_tone": [],
+            "transcript_highlights": [],
+            "transcript_dict": chunk_text.split("\n"),
+            "error": "empty",
+        }
     try:
-        if content:
-            return json.loads(content) 
-        else:
-            logger.warning("⚠️ Empty response for chunk analysis")
-            return {
-                "summary": "Error analyzing chunk",
-                "purpose": "",
-                "key_points": [],
-                "users_tasks": {},
-                "next_steps": [],
-                "transcript_dict": chunk_text.split("\n"),
-                "error": "empty",
-            }
-       
-    except Exception as e:
-        logger.exception(f"❌ Failed to parse JSON for chunk: {e}")
-        return {"error": str(e), "transcript_dict": chunk_text.split("\n")}
+        result = json.loads(content)
 
-async def merge_analysis(all_chunk_results: list[dict], transcript_list: list[str]) -> dict:
+        # Normalize output structure
+        def _normalize_topics(raw_topics):
+            out = []
+            if isinstance(raw_topics, list):
+                for t in raw_topics:
+                    if isinstance(t, dict):
+                        out.append({
+                            "title": _safe_text(t.get("title") or t.get("topic") or "Untitled Topic"),
+                            "problem": t.get("problem") if t.get("problem") or t.get("problem") == "" else None,
+                            "solution": _safe_text(t.get("solution") or t.get("resolve") or ""),
+                            "rationale": _safe_text(t.get("rationale") or t.get("why") or "") or None,
+                            "postponed_items": _coerce_list(t.get("postponed_items") or t.get("deferred") or []),
+                        })
+                    elif isinstance(t, str) and t.strip():
+                        out.append({
+                            "title": t.strip(),
+                            "problem": None,
+                            "solution": "",
+                            "rationale": None,
+                            "postponed_items": [],
+                        })
+            return out
+
+        def _normalize_action_items(raw):
+            out = []
+            if isinstance(raw, list):
+                for item in raw:
+                    if isinstance(item, dict):
+                        owner = _safe_text(item.get("owner") or item.get("assignee") or "Unknown")
+                        task = _safe_text(item.get("task") or item.get("action") or "")
+                        priority = _safe_text(item.get("priority") or "") or None
+                        deadline = _safe_text(item.get("deadline") or item.get("due") or "") or None
+                        if owner or task:
+                            out.append({"owner": owner or "Unknown", "task": task or "no task", "priority": priority, "deadline": deadline})
+                    elif isinstance(item, str) and item.strip():
+                        out.append({"owner": "Unknown", "task": item.strip(), "priority": None, "deadline": None})
+            elif isinstance(raw, dict):
+                for k, v in raw.items():
+                    if isinstance(v, list) and v:
+                        for task in v:
+                            if isinstance(task, str):
+                                out.append({"owner": _safe_text(k), "task": task.strip(), "priority": None, "deadline": None})
+                    elif isinstance(v, str):
+                        out.append({"owner": _safe_text(k), "task": v.strip(), "priority": None, "deadline": None})
+            return out
+
+        normalized = {
+            "meeting_purpose": _safe_text(result.get("meeting_purpose") or result.get("purpose") or ""),
+            "key_takeaways": _coerce_list(result.get("key_takeaways") or result.get("key_points") or []),
+            "decisions": _coerce_list(result.get("decisions") or []),
+            "topics": _normalize_topics(result.get("topics") or []),
+            "action_items": _normalize_action_items(result.get("action_items") or result.get("users_tasks") or []),
+            "blockers": _coerce_list(result.get("blockers") or result.get("negative_points") or []),
+            "next_steps": _coerce_list(result.get("next_steps") or []),
+            "transcript_dict": _coerce_list(result.get("transcript_dict") or chunk_text.split("\n")),
+        }
+        return normalized
+    except Exception as e:
+        logger.exception(f" Failed to parse JSON for chunk: {e}")
+        return {
+            "meeting_purpose": "",
+            "key_takeaways": [],
+            "decisions": [],
+            "topics": [],
+            "action_items": [],
+            "blockers": [],
+            "next_steps": [],
+            "transcript_dict": chunk_text.split("\n"),
+            "error": str(e),
+        }
+
+def _strip_chunk_results(chunk_results: list[dict]) -> list[dict]:
+    """
+    Strip transcript_dict from chunk results to reduce token count.
+    Keep only analysis fields needed for merging.
+    """
+    stripped = []
+    for ch in chunk_results:
+        if not isinstance(ch, dict):
+            continue
+        stripped_ch = {
+            "meeting_purpose": ch.get("meeting_purpose", ""),
+            "key_takeaways": ch.get("key_takeaways", []),
+            "decisions": ch.get("decisions", []),
+            "topics": ch.get("topics", []),
+            "action_items": ch.get("action_items", []),
+            "blockers": ch.get("blockers", []),
+            "next_steps": ch.get("next_steps", []),
+            "meeting_tone": ch.get("meeting_tone", []),
+            "transcript_highlights": ch.get("transcript_highlights", []),
+        }
+        stripped.append(stripped_ch)
+    return stripped
+
+def _estimate_tokens(text: str) -> int:
+    """Quick token estimation (1 token ≈ 4 characters)."""
+    return int(len(text) / 4) + 500  # add buffer for JSON overhead
+
+async def merge_analysis(all_chunk_results: list[dict], transcript_list: list[str], all_participants_count: int, participants_list: list) -> dict:
     """Merge all chunk analyses with gpt-4o.
 
     Includes robust JSON-recovery logic when the model returns invalid/truncated JSON
     (e.g. unterminated string). Tries multiple heuristics before failing.
     """
+    ####SAFETY CHECK: Ensure we don't exceed model context length with the merge prompt
+    stripped_results = _strip_chunk_results(all_chunk_results)
+
     merge_prompt = f"""
-        You are a meeting assistant. Multiple partial analyses are provided.
-        Merge them into a single final JSON analysis.
+    You are a senior AI meeting analyst.  
+    Your only source of truth is the partial analyses below.  
+    Do NOT add, guess, or infer information not present in these inputs.
 
-        Partial analyses (JSON list):
-        {json.dumps(all_chunk_results, ensure_ascii=False)}
+    **IMPORTANT - Product Names (USE EXACTLY THESE):**
+    - Allowed products: AngelPBX, AngelEcho, AngelGo, AngelMeet, AngelTeam
+    - If any partial analysis mentions a product variant, standardize to the correct name from the list above
+    - If no product from the list matches, keep the original text as-is
 
-        Instructions:
-        - Combine summaries into one coherent summary
-        - Merge purposes into one clear purpose
-        - Deduplicate key points and next_steps
-        - users_tasks:
-            * Must include ALL users that appear in the transcript.
-            * If a user has no assigned task, still list them with ["no task"].
-        - transcript_dict must include the FULL transcript (all lines)
+    Partial analyses:
+    {json.dumps(stripped_results, ensure_ascii=False)}
 
-        Return ONLY a JSON object with fields:
-        summary, purpose, key_points, users_tasks, next_steps, transcript_dict
-        """
+    ---
+
+    ## STRICT RULES
+
+    ### 0. No Hallucination
+    - Every output must be directly traceable to the provided partial analyses.
+    - Do NOT create new names, deadlines, priorities, or decisions.
+    - If information conflicts between analyses → choose the most complete and consistent version.
+    - If missing → keep null or omit.
+
+    ### 1. No Repetition Across Sections (CRITICAL)
+    - A single piece of information can appear in **only one** output section.
+    - If an insight is placed in `key_takeaways`, it cannot reappear in `decisions`, `topics`, or `next_steps`.
+    - If a decision exists → do NOT copy it into `topics` or `takeaways`.
+    - If an action item exists → do NOT duplicate it in `next_steps`.
+    - Merge duplicates within the same section intelligently.
+
+    ### 2. Meeting Purpose
+    - ONE clear, unambiguous sentence.
+    - Answer: why meeting happened + expected outcome.
+    - Avoid: "discussion", "sync", "check-in".
+    
+    ### 3. Key Takeaways
+    - 4–5 unique insights maximum.
+    - High-level, not operational.
+    - Must not appear in any other section.
+    - **Standardize product names** to: AngelPBX, AngelEcho, AngelGo, AngelMeet, AngelTeam
+
+    ### 4. Decisions
+    - Only finalized, high-impact decisions.
+    - Exclude discussions without outcomes.
+    - No overlap with takeaways or topics.
+    - **Use correct product names**
+
+    ### 5. Topics
+    - Merge similar topics by meaning, not by exact title.
+    - Each topic = one problem → one solution.
+    - Do NOT repeat decisions or takeaways inside topics.
+    - **For product-related topics**: Always use exact names from allowed list
+
+    Each topic:
+    - `title`: outcome-focused, specific (use correct product names)
+    - `problem`: include person/team only if explicitly named (else null)
+    - `solution`: final outcome (use correct product names)
+    - `rationale`: why chosen (must be stated in inputs)
+    - `postponed_items`: only explicitly postponed items (else [])
+
+    ### 6. Action Items (CRITICAL RULE)
+    **You have the all participants lis {participants_list} , mentioned all update into action item do not missed any one to update into action item if they have any task to do , and make sure every participant appear once in action item if they have task to do .**
+    - Group strictly by owner
+    - Each owner must appear ONLY ONCE
+    - Merge all tasks of the same owner into one entry
+    - Task field must summarize all responsibilities clearly
+    - Remove duplicate or overlapping tasks
+    - Assign priority:
+        - high → urgent / blockers / critical path
+        - medium → important but not urgent
+        - low → minor or optional
+    - Keep deadline if explicitly mentioned
+    - **Before final output, verify: every transcript participant appears exactly once**.
+    
+    ### 7. Blockers
+    - Merge duplicates.
+    - Only unresolved blockers impacting delivery/timelines.
+    - Exclude minor or already resolved items.
+    - **Use correct product names for any blocker mentions**
+
+    ### 8. Next Steps (FORMAT-STRICT)
+    - Maximum 5–6 items.
+    - **Must follow this exact format**: `"Name: Action with timeline if mentioned"`
+    - Do NOT repeat action items.
+    - Do NOT repeat decisions or takeaways.
+    - Focus only on forward-looking, project-level steps.
+    - If multiple steps for same person → merge into one `"Name: Action1 and Action2"`
+    - **If action mentions a product**: Use exact name from allowed list
+
+    Examples:
+    - `"Nisha: Schedule extended DSU for tomorrow morning to review AngelPBX deployment"`
+    - `"Riddhee & Sayantan: Connect tomorrow at 10 AM for AngelEcho UI/UX walkthrough"`
+    - `"Product Team: Finalize AngelMeet Q3 roadmap by Friday"`
+
+    ⚠️ No bare dash lists (`"- task"`). Enforce `"Name: Content"` strictly.
+
+    ### 9. Meeting Tone
+    - 3–4 sharp observations.
+    - From tone of inputs (alignment, urgency, accountability, concerns).
+    - No generic statements.
+
+    ### 10. Transcript Highlights
+    - 4–5 impactful, rephrased statements.
+    - Include speaker attribution.
+    - Focus on commitments, risks, key decisions.
+    - Do NOT duplicate other sections.
+    - **Standardize product names**
+
+    ---
+
+    ## PRODUCT NAME STANDARDIZATION RULES:
+
+    **Allowed product names (use these EXACT spellings):**
+    1. AngelPBX
+    2. AngelEcho
+    3. AngelGo
+    4. AngelMeet
+    5. AngelTeam
+
+    **Mapping guidance:**
+    | Variation in input | Standardize to |
+    |-------------------|----------------|
+    | "PBX", "Angel PBX", "angelpbx", "ANGELPBX" | AngelPBX |
+    | "echo", "Angel echo", "ECHO" | AngelEcho |
+    | "go", "Angel go", "GO", "Go" | AngelGo |
+    | "meet", "Angel meet", "MEET" | AngelMeet |
+    | "team", "Angel team", "TEAM" | AngelTeam |
+    | Any product term with "angel" prefix not in list | Keep original but capitalize properly |
+    | Generic "product" without specification | Keep as-is (do NOT assign a product name) |
+
+    **If you are unsure which product is being discussed:**
+    - Look for context clues in the transcript
+    - If multiple products mentioned, keep each separate
+    - **DO NOT guess or assign a product name that isn't clearly indicated**
+
+    ---
+
+    ## OUTPUT JSON (only valid JSON, no extra text)
+
+    {{
+    "meeting_purpose": "string",
+    "key_takeaways": ["..."],
+    "decisions": ["..."],
+    "topics": [
+        {{
+        "title": "string",
+        "problem": "string or null",
+        "solution": "string",
+        "rationale": "string",
+        "postponed_items": ["..."]
+        }}
+    ],
+    "action_items": [
+        {{
+        "owner": "string",
+        "task": "string",
+        "priority": "high | medium | low | null",
+        "deadline": "string or null"
+        }}
+    ],
+    "blockers": ["..."],
+    "next_steps": ["..."],
+    "meeting_tone": ["..."],
+    "transcript_highlights": ["..."]
+    }}
+
+    ---
+
+    ## FINAL CHECKS (before output)
+    - [ ] No duplicate information across sections
+    - [ ] No hallucinated content
+    - [ ] Each `next_steps` element starts with a **name + colon + space**
+    - [ ] Each owner appears once in `action_items`
+    - [ ] All product names are standardized to: AngelPBX, AngelEcho, AngelGo, AngelMeet, AngelTeam
+    - [ ] No product name is invented (only map from existing mentions)
+    - [ ] Valid JSON only (no trailing commas, no extra text)
+    """
+
+    ### SAFETY CHECK: Estimate tokens and fallback to local merge if too large
+    estimated_tokens = _estimate_tokens(merge_prompt)
+    max_safe_tokens = 100000  # Leave buffer before 128k limit
+    
+    if estimated_tokens > max_safe_tokens:
+        logger.warning(
+            f" Merge prompt too large ({estimated_tokens} est. tokens). "
+            f"Falling back to local merge to save computation."
+        )
+        return _local_merge(all_chunk_results, transcript_list)
+
+    def _normalize_topic_item(item: dict) -> dict:
+        return {
+            "title": _safe_text(item.get("title") or item.get("topic") or "Untitled Topic"),
+            "problem": item.get("problem") if item.get("problem") is not None else None,
+            "solution": _safe_text(item.get("solution") or item.get("outcome") or ""),
+            "rationale": _safe_text(item.get("rationale") or item.get("why") or "") or None,
+            "postponed_items": _coerce_list(item.get("postponed_items") or []),
+        }
+
+    def _normalize_topics(raw) -> list:
+        topics = []
+        if isinstance(raw, list):
+            for t in raw:
+                if isinstance(t, dict):
+                    topics.append(_normalize_topic_item(t))
+                elif isinstance(t, str) and t.strip():
+                    topics.append({"title": t.strip(), "problem": None, "solution": "", "rationale": None, "postponed_items": []})
+        return topics
+
+    def _normalize_action_items(raw) -> list:
+        out = []
+        if isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    owner = _safe_text(item.get("owner") or item.get("assignee") or "Unknown")
+                    task = _safe_text(item.get("task") or item.get("action") or "no task")
+                    priority = _safe_text(item.get("priority") or "") or None
+                    deadline = _safe_text(item.get("deadline") or item.get("due") or "") or None
+                    out.append({"owner": owner or "Unknown", "task": task, "priority": priority, "deadline": deadline})
+                elif isinstance(item, str) and item.strip():
+                    out.append({"owner": "Unknown", "task": item.strip(), "priority": None, "deadline": None})
+        elif isinstance(raw, dict):
+            # fallback old map format
+            for owner, tasks in raw.items():
+                if isinstance(tasks, list):
+                    for task in tasks:
+                        if isinstance(task, str):
+                            out.append({"owner": _safe_text(owner), "task": task.strip(), "priority": None, "deadline": None})
+                elif isinstance(tasks, str):
+                    out.append({"owner": _safe_text(owner), "task": tasks.strip(), "priority": None, "deadline": None})
+        return out
+
+    def _ensure_list(value):
+        return value if isinstance(value, list) else []
+
+    def _normalize_final_result(result: dict, transcript_list: list[str]) -> dict:
+        if not isinstance(result, dict):
+            result = {}
+        
+        # deduplicate lists
+        def dedup_list(lst):
+            seen = set()
+            out = []
+            for item in lst:
+                if isinstance(item, str) and item.strip() and item not in seen:
+                    out.append(item.strip())
+                    seen.add(item)
+            return out
+        
+        # deduplicate topics by title
+        raw_topics = _ensure_list(result.get("topics") or [])
+        topics_dict = {}
+        for t in raw_topics:
+            if isinstance(t, dict):
+                norm_t = _normalize_topic_item(t)
+                title = norm_t["title"]
+                if title not in topics_dict:
+                    topics_dict[title] = norm_t
+        
+        # deduplicate action_items by (owner, task)
+        raw_action_items = _ensure_list(result.get("action_items") or result.get("users_tasks") or [])
+        action_items = []
+        action_set = set()
+        for ai in _normalize_action_items(raw_action_items):
+            key = (ai["owner"], ai["task"])
+            if key not in action_set:
+                action_items.append(ai)
+                action_set.add(key)
+        
+        final = {
+            "meeting_purpose": _safe_text(result.get("meeting_purpose") or result.get("purpose") or ""),
+            "key_takeaways": dedup_list(_coerce_list(result.get("key_takeaways") or result.get("key_points") or [])),
+            "decisions": dedup_list(_coerce_list(result.get("decisions") or [])),
+            "topics": list(topics_dict.values()),
+            "action_items": action_items,
+            "blockers": dedup_list(_coerce_list(result.get("blockers") or result.get("negative_points") or [])),
+            "next_steps": dedup_list(_coerce_list(result.get("next_steps") or [])),
+            "meeting_tone": dedup_list(_coerce_list(result.get("meeting_tone") or [])),
+            "transcript_highlights": dedup_list(_coerce_list(result.get("transcript_highlights") or [])),
+            "transcript_dict": transcript_list,
+        }
+
+        # ensure required shape for topics
+        if not final["topics"]:
+            final["topics"] = []
+
+        # ensure required shape for action_items
+        if not final["action_items"]:
+            final["action_items"] = []
+
+        return final
 
     def _try_extract_balanced_json(s: str) -> str | None:
-        """Attempt to extract a balanced JSON object substring from s.
-
-        Strategy:
-        - Find each opening brace '{' or '[' and scan forward keeping a stack counter.
-        - When the counter returns to zero, attempt to parse that substring as JSON.
-        - Return the first successfully parsed JSON text (string) or None.
-        """
         starts = []
         for i, ch in enumerate(s):
             if ch in '{[':
@@ -163,92 +677,84 @@ async def merge_analysis(all_chunk_results: list[dict], transcript_list: list[st
                         stack.pop()
                     if not stack:
                         candidate = s[start_idx:j+1]
-                        # quick sanity checks
                         if len(candidate) < 5:
                             continue
                         try:
                             json.loads(candidate)
                             return candidate
                         except Exception:
-                            # try next possible closing
                             continue
         return None
 
     def _local_merge(all_chunks: list[dict], transcript_list: list[str]) -> dict:
-        """
-        Fallback merge when the LLM returns invalid JSON.
-        We combine the partial analyses directly in Python.
-        """
-        summaries = []
-        purposes = []
-        key_points: list[str] = []
-        next_steps: list[str] = []
-        users_tasks: dict[str, set[str]] = {}
+        meeting_purpose = ""
+        key_takeaways = []
+        decisions = []
+        topics = []
+        action_items = []
+        blockers = []
+        next_steps = []
+        meeting_tone = []
+        transcript_highlights = []
+
+        topics_dict = {}  # deduplicate by title
+        action_set = set()  # deduplicate by (owner, task)
 
         for ch in all_chunks:
             if not isinstance(ch, dict):
                 continue
-
-            # Summaries
-            s = ch.get("summary")
-            if isinstance(s, str) and s.strip():
-                summaries.append(s.strip())
-
-            # Purpose
-            p = ch.get("purpose")
-            if isinstance(p, str) and p.strip():
-                purposes.append(p.strip())
-
-            # Key points
-            kp = ch.get("key_points") or []
-            if isinstance(kp, list):
-                for item in kp:
-                    if isinstance(item, str) and item.strip() and item not in key_points:
-                        key_points.append(item)
-
-            # Next steps
-            ns = ch.get("next_steps") or []
-            if isinstance(ns, list):
-                for item in ns:
-                    if isinstance(item, str) and item.strip() and item not in next_steps:
-                        next_steps.append(item)
-
-            # Users tasks
-            ut = ch.get("users_tasks") or {}
-            if isinstance(ut, dict):
-                for user, tasks in ut.items():
-                    if not isinstance(user, str) or not user.strip():
-                        continue
-                    if user not in users_tasks:
-                        users_tasks[user] = set()
-                    if isinstance(tasks, list):
-                        for t in tasks:
-                            if isinstance(t, str) and t.strip():
-                                users_tasks[user].add(t.strip())
-
-        # Deduplicate purposes but keep order
-        seen_purposes = set()
-        merged_purposes = []
-        for p in purposes:
-            if p not in seen_purposes:
-                seen_purposes.add(p)
-                merged_purposes.append(p)
-        merged_purpose = " | ".join(merged_purposes) if merged_purposes else ""
-
-        merged_summary = "\n\n".join(summaries) if summaries else ""
-
-        # Convert users_tasks sets back to lists
-        users_tasks_list = {
-            user: sorted(list(tasks)) if tasks else ["no task"]
-            for user, tasks in users_tasks.items()
-        }
+            if not meeting_purpose:
+                meeting_purpose = _safe_text(ch.get("meeting_purpose") or ch.get("purpose") or "")
+            for item in _coerce_list(ch.get("key_takeaways") or ch.get("key_points") or []):
+                if isinstance(item, str) and item.strip() and item not in key_takeaways:
+                    key_takeaways.append(item.strip())
+            for item in _coerce_list(ch.get("decisions") or []):
+                if isinstance(item, str) and item.strip() and item not in decisions:
+                    decisions.append(item.strip())
+            for item in _coerce_list(ch.get("blockers") or ch.get("negative_points") or []):
+                if isinstance(item, str) and item.strip() and item not in blockers:
+                    blockers.append(item.strip())
+            for item in _coerce_list(ch.get("next_steps") or []):
+                if isinstance(item, str) and item.strip() and item not in next_steps:
+                    next_steps.append(item.strip())
+            for item in _coerce_list(ch.get("meeting_tone") or []):
+                if isinstance(item, str) and item.strip() and item not in meeting_tone:
+                    meeting_tone.append(item.strip())
+            for item in _coerce_list(ch.get("transcript_highlights") or []):
+                if isinstance(item, str) and item.strip() and item not in transcript_highlights:
+                    transcript_highlights.append(item.strip())
+            raw_topics = ch.get("topics") or []
+            if isinstance(raw_topics, list):
+                for t in raw_topics:
+                    if isinstance(t, dict):
+                        norm_t = _normalize_topic_item(t)
+                        title = norm_t["title"]
+                        if title not in topics_dict:
+                            topics_dict[title] = norm_t
+                        else:
+                            # merge if needed, but for simplicity, keep first
+                            pass
+                    elif isinstance(t, str) and t.strip():
+                        title = t.strip()
+                        if title not in topics_dict:
+                            topics_dict[title] = {"title": title, "problem": None, "solution": "", "rationale": None, "postponed_items": []}
+            raw_action_items = ch.get("action_items") or ch.get("users_tasks") or []
+            for ai in _normalize_action_items(raw_action_items):
+                key = (ai["owner"], ai["task"])
+                if key not in action_set:
+                    action_items.append(ai)
+                    action_set.add(key)
 
         return {
-            "summary": merged_summary or "Summary not available (local merge fallback).",
-            "purpose": merged_purpose,
-            "key_points": key_points,
-            "users_tasks": users_tasks_list,
+            "meeting_purpose": meeting_purpose or "Meeting purpose not available (local fallback).",
+            "key_takeaways": key_takeaways,
+            "decisions": decisions,
+            "topics": list(topics_dict.values()),
+            "action_items": action_items,
+            "blockers": blockers,
             "next_steps": next_steps,
+            "meeting_tone": meeting_tone,
+            "transcript_highlights": transcript_highlights,
             "transcript_dict": transcript_list,
             "merge_mode": "local_fallback",
         }
@@ -260,15 +766,16 @@ async def merge_analysis(all_chunk_results: list[dict], transcript_list: list[st
             content = await chat_completion(MODEL_FINAL, merge_prompt)
             last_content = content
             if not content:
-                logger.warning(f"⚠️ Empty response on merge attempt {attempt}/{retries}")
+                logger.warning(f" Empty response on merge attempt {attempt}/{retries}")
             else:
                 try:
                     result = json.loads(content)
-                    result["transcript_dict"] = transcript_list
-                    return result
+                    normalized = _normalize_final_result(result, transcript_list)
+                    logger.info(f" Final merge successful: key_points={len(normalized.get('key_points', []))} items")
+                    return normalized
                 except Exception as e:
                     # Log the parse error and attempt recovery heuristics
-                    logger.error(f"❌ Failed to parse final merge JSON (attempt {attempt}/{retries}): {e}")
+                    logger.error(f" Failed to parse final merge JSON (attempt {attempt}/{retries}): {e}")
                     logger.debug(f"Raw model response (truncated 32k): {repr(content[:32768])}")
 
                     # Heuristic 1: try to extract a balanced JSON substring from the model response
@@ -276,11 +783,11 @@ async def merge_analysis(all_chunk_results: list[dict], transcript_list: list[st
                     if recovered:
                         try:
                             result = json.loads(recovered)
-                            result["transcript_dict"] = transcript_list
-                            logger.info(f"✅ Successfully recovered JSON from model response on attempt {attempt}")
-                            return result
+                            normalized = _normalize_final_result(result, transcript_list)
+                            logger.info(f" Successfully recovered JSON from model response on attempt {attempt}")
+                            return normalized
                         except Exception as e2:
-                            logger.exception(f"❌ Recovered substring still failed to parse: {e2}")
+                            logger.exception(f" Recovered substring still failed to parse: {e2}")
 
                     # Heuristic 2: try simple fixes for unterminated string errors
                     if isinstance(e, json.JSONDecodeError) and 'Unterminated string' in str(e):
@@ -288,26 +795,28 @@ async def merge_analysis(all_chunk_results: list[dict], transcript_list: list[st
                         alt = content + '"}'
                         try:
                             result = json.loads(alt)
-                            result["transcript_dict"] = transcript_list
-                            logger.info(f"✅ Fixed JSON by appending closing characters on attempt {attempt}")
-                            return result
+                            normalized = _normalize_final_result(result, transcript_list)
+                            logger.info(f" Fixed JSON by appending closing characters on attempt {attempt}")
+                            return normalized
                         except Exception:
-                            logger.debug("⚠️ Quick append fix did not work")
+                            logger.debug(" Quick append fix did not work")
 
                     # If parsing failed, allow retry (the for-loop will continue)
 
         except RateLimitError as r:
-            logger.exception(f"❌ OpenAI quota exceeded: {r}")
+            logger.exception(f" OpenAI quota exceeded: {r}")
             return {
-                "summary": "OpenAI limit exceed",
-                "purpose": "",
-                "key_points": [],
-                "users_tasks": {},
+                "meeting_purpose": "",
+                "key_takeaways": [],
+                "decisions": [],
+                "topics": [],
+                "action_items": [],
+                "blockers": [],
                 "next_steps": [],
                 "transcript_dict": transcript_list,
             }
         except Exception as e:
-            logger.exception(f"❌ Unexpected error during merge (attempt {attempt}/{retries}): {e}")
+            logger.exception(f" Unexpected error during merge (attempt {attempt}/{retries}): {e}")
 
         # Small delay before retrying
         if attempt < retries:
@@ -315,30 +824,31 @@ async def merge_analysis(all_chunk_results: list[dict], transcript_list: list[st
 
     # After retries, attempt one final recovery from last_content if available
     if last_content:
-        logger.warning("⚠️ All merge attempts failed — attempting final recovery from last response")
+        logger.warning(" All merge attempts failed — attempting final recovery from last response")
         recovered = _try_extract_balanced_json(last_content)
         if recovered:
             try:
                 result = json.loads(recovered)
-                result["transcript_dict"] = transcript_list
-                logger.info("✅ Final recovery succeeded")
-                return result
+                normalized = _normalize_final_result(result, transcript_list)
+                logger.info(" Final recovery succeeded")
+                return normalized
             except Exception as e:
-                logger.exception(f"❌ Final recovery parse failed: {e}")
+                logger.exception(f" Final recovery parse failed: {e}")
 
                 # If still can't parse, fall back to local merge
-        logger.error("❌ Merge failed after all retries and recoveries — falling back to local merge.")
+        logger.error(" Merge failed after all retries and recoveries — falling back to local merge.")
         return _local_merge(all_chunk_results, transcript_list)
 
-    logger.error("❌ Merge failed after all retries — falling back to local merge.")
+    logger.error(" Merge failed after all retries — falling back to local merge.")
     return _local_merge(all_chunk_results, transcript_list)
 
 
 # ----------------- MAIN ANALYSIS -----------------
-async def _analyze_chunked(transcript_list: list[str]) -> dict:
+async def _analyze_chunked(transcript_list: list[str], all_participants_count: int, participants_list: list) -> dict:
+    
     transcript_list = [str(x) for x in transcript_list]
     chunks = chunk_lines_by_tokens(transcript_list, CHUNK_TOKEN_LIMIT)
-    logger.info(f"📊 Total chunks to process: {len(chunks)}")
+    logger.info(f" Total chunks to process: {len(chunks)}")
 
     all_chunk_results = []
     start_time = time.time()
@@ -349,14 +859,14 @@ async def _analyze_chunked(transcript_list: list[str]) -> dict:
         batch_texts = ["\n".join(c) for c in batch]
 
         logger.info(f"⏳ Processing batch {i//MAX_PARALLEL_CHUNKS + 1} with {len(batch)} chunks...")
-        results = await asyncio.gather(*[analyze_chunk(ct) for ct in batch_texts])
+        results = await asyncio.gather(*[analyze_chunk(ct, all_participants_count, participants_list) for ct in batch_texts])
         all_chunk_results.extend(results)
 
-    logger.info(f"✅ All chunks analyzed in {time.time() - start_time:.2f}s. Merging...")
+    logger.info(f" All chunks analyzed in {time.time() - start_time:.2f}s. Merging...")
 
     # Merge with gpt-4o
-    final_result = await merge_analysis(all_chunk_results, transcript_list)
-    logger.info(f"✅ Final merge complete in {time.time() - start_time:.2f}s.")
+    final_result = await merge_analysis(all_chunk_results, transcript_list,all_participants_count, participants_list)
+    logger.info(f" Final merge complete in {time.time() - start_time:.2f}s.")
     return final_result
 
 # ----------------- CELERY TASK -----------------
@@ -375,38 +885,43 @@ def analyze_transcript(call_db_id: str):
         # Fetch the call row by unique DB id
         note_call = db.query(NoteTakerCall).filter_by(id=call_db_id).first()
         if not note_call:
-            logger.warning(f"⚠️ No call found with db id {call_db_id}")
+            logger.warning(f" No call found with db id {call_db_id}")
             return {"error": "call not found"}
 
         # Extract raw transcript list (saved earlier)
         transcript_list = []
         if note_call.call_analysis and "transcript_dict" in note_call.call_analysis:
             transcript_list = note_call.call_analysis["transcript_dict"]
+            all_participants_count = getattr(note_call, "all_participants_count", 0)
+            participants_list = getattr(note_call, "participants_list", [])
+            logger.info(f" #######################################    Loaded transcript with {participants_list} lines for call {call_db_id}")
+        
 
         if not transcript_list:
-            logger.warning(f"⚠️ No transcript found for call {call_db_id}")
+            logger.warning(f" No transcript found for call {call_db_id}")
             return {"error": "no transcript"}
 
         # Run async analysis
-        result = loop.run_until_complete(_analyze_chunked(transcript_list))
+        result = loop.run_until_complete(_analyze_chunked(transcript_list,all_participants_count,participants_list))
+        logger.info(f" Analysis result: meeting_purpose={result.get('meeting_purpose')} key_takeaways={len(result.get('key_takeaways', []))} decisions={len(result.get('decisions', []))}")
 
         # Ensure JSON serializable
         try:
             result_json = json.loads(json.dumps(result))
         except Exception as e:
-            logger.exception(f"❌ Result not JSON serializable: {e}")
+            logger.exception(f" Result not JSON serializable: {e}")
             result_json = {"error": "not JSON serializable", "raw": str(result)}
 
         # Update DB row
-        note_call.call_analysis = result_json  # ✅ overwrite "pending"
+        note_call.call_analysis = result_json  #  overwrite "pending"
         db.add(note_call)
         db.commit()
-        logger.info(f"✅ Analysis saved for call {call_db_id}")
+        logger.info(f" Analysis saved for call {call_db_id}")
 
         return result_json
 
     except Exception as e:
-        logger.exception(f"❌ Error analyzing call {call_db_id}: {e}")
+        logger.exception(f" Error analyzing call {call_db_id}: {e}")
         db.rollback()
         return {"error": str(e)}
     finally:
