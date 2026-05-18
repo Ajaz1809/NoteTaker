@@ -18,11 +18,8 @@ from fastapi import (
     Header,
     Request,
 )
-from utils.helpers import is_user_in_workspace, generate_api_key
 from sqlalchemy.orm import Session, joinedload
-from sqlalchemy import select
 import uuid
-from fastapi.responses import JSONResponse, StreamingResponse
 import requests
 from bs4 import BeautifulSoup
 import time, json
@@ -39,41 +36,25 @@ from models.models import (
     WorkspaceMember,
     KnowledgeBase,
     KnowledgeFile,
-    APIKey,
     FileStatus,
     SourceStatus,
-    pbx_ai_agent,
     PBXLLM,
-    ChatSession,
-    LLMVoice,
     NoteTakerCall,
-    ConversationalFlow,
 )
 from models.schemas import (
-
     CallListRequest,
     UserSignup,
     UserLogin,
     UpdateUser,
     DispatchRequest,
     CreateRoomRequestSchema,
-    GetPBXLLMOut,
     WorkspaceCreate,
     WorkspaceOut,
     InviteMember,
     WorkspaceSettingsUpdate,
-    AgentCreate,
-    PBXLLMCreate,
-    PBXLLMOut,
-    CreateChatRequest,
-    CreateChatResponse,
-    VoiceOut,
-    VoiceCreate,
-    APIResponse,
-    AgentUpdate,
     CallIDRequest,
+    ReanalyzeRequest,
   
-   
 )
 from utils.helpers import (
     format_response,
@@ -82,42 +63,65 @@ from utils.helpers import (
     format_datetime_ist,
 )
 
-from livekit.protocol.sip import (
-    ListSIPDispatchRuleRequest, 
-    ListSIPInboundTrunkRequest, 
-    CreateSIPInboundTrunkRequest, 
-    CreateSIPDispatchRuleRequest, 
-    DeleteSIPTrunkRequest, 
-    ListSIPTrunkRequest,
-    ListSIPOutboundTrunkRequest,
-    CreateSIPOutboundTrunkRequest,
-)
+
 from livekit.api import (
     LiveKitAPI,
-    ListSIPInboundTrunkRequest,
-    CreateSIPInboundTrunkRequest,
-    SIPInboundTrunkInfo,
-    ListSIPDispatchRuleRequest,
-    CreateSIPDispatchRuleRequest,
     RoomParticipantIdentity
 )
 from utils.security import hash_password, verify_password, create_token
-
 from starlette.config import Config
-
-from models.schemas import PhoneNumberOut
 from utils.custom_voice import validate_voice_id
 import re,logging
-
 from db.database import engine
+import asyncio
+from models.models import NoteTakerReanalysis
+from openai import OpenAI
+
+import time
+import traceback
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+from livekit import api
+from livekit.api import (
+    RoomParticipantIdentity,
+    ListParticipantsRequest,
+)
+
+import os
+VALIDATION_API_URL = os.getenv("VALIDATION_API_URL")
+
+def _coerce_list(value):
+    """Convert value to list if it's not already a list"""
+    if isinstance(value, list):
+        return value
+    elif isinstance(value, str):
+        return [value]
+    else:
+        return []
+
+
+def _safe_text(value):
+    """Convert value to safe text string"""
+    return str(value).strip() if value else ""
+
+
+def dedup_list(items):
+    """Remove duplicates from list while preserving order"""
+    seen = set()
+    result = []
+    for item in items:
+        item_lower = item.lower().strip()
+        if item_lower not in seen and item_lower:
+            seen.add(item_lower)
+            result.append(item)
+    return result
+
 logger = logging.getLogger("routes")
 router = APIRouter()
-
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads")).resolve()
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -145,7 +149,6 @@ def check_username_availability(
             message="Internal Server Error",
             errors=[{"field": "server", "message": str(e)}],
         )
-
 
 @router.post("/signup")
 def signup(user: UserSignup, db: Session = Depends(get_db)):
@@ -219,7 +222,6 @@ def signup(user: UserSignup, db: Session = Depends(get_db)):
             message="Internal Server Error",
             errors=[{"field": "server", "message": str(e)}],
         )
-
 
 @router.post("/login")
 async def login(user: UserLogin, db: Session = Depends(get_db)):
@@ -301,7 +303,6 @@ def update_user(
 
         updated = False
         errors = []
-
         # Update username
         if user_data.username and user_data.username != existing_user.username:
             username_exists = (
@@ -380,6 +381,8 @@ def update_user(
         )
 
 
+##################################################################################################new
+
 @router.post("/create-room-token")
 async def create_room_and_token(
     request: CreateRoomRequestSchema,
@@ -390,12 +393,12 @@ async def create_room_and_token(
         if not authorization.startswith('Bearer '):
             raise HTTPException(status_code=401, detail="Invalid authorization header")
         
-        token = authorization.split(' ')[1]
+        auth_token = authorization.split(' ')[1]  # Renamed to avoid conflict
         
         # Try UCAAS validation first
         try:
-            url = os.environ('EXTERNAL_URL', 'https://ucaas.webvio.in/backend/api/user')
-            headers = {'Authorization': f'Bearer {token}'}
+            url = os.getenv('EXTERNAL_URL', 'https://ucaas.webvio.in/backend/api/user')  # Fixed: os.getenv
+            headers = {'Authorization': f'Bearer {auth_token}'}
             
             with httpx.Client() as client:
                 response = client.get(url, headers=headers)
@@ -420,7 +423,7 @@ async def create_room_and_token(
                 else:
                     # If UCAAS fails, try JWT
                     from utils.security import decode_token
-                    payload = decode_token(token)
+                    payload = decode_token(auth_token)
                     user = db.query(User).filter(User.email == payload.get("email")).first()
                     if not user:
                         raise HTTPException(status_code=401, detail="User not found")
@@ -445,7 +448,7 @@ async def create_room_and_token(
                 status_code=403, detail="User is not a member of any workspace"
             )
 
-        # 🔥 Step 2: Search for agent in user's workspaces
+        # Search for agent in user's workspaces
         agent = (
             db.query(pbx_ai_agent)
             .filter(
@@ -461,27 +464,32 @@ async def create_room_and_token(
                 status_code=404,
                 detail="No LLM configuration & Agent not found for this user",
             )
-
-        # 🔥 Step 2: Create room (optional - LiveKit auto-creates)
+        
+        # Create room
         lkapi = api.LiveKitAPI(
             url=LIVEKIT_URL, api_key=LIVEKIT_API_KEY, api_secret=LIVEKIT_API_SECRET
         )
         try:
+            metadata_payload = {
+                "meeting_id": str(request.meeting_id),
+                "user_id": str(request.user_id),
+                "conf_name": str(request.conf_name),
+            }
             lkapi.room.create_room(
                 api.CreateRoomRequest(
                     name=request.room_name,
-                    empty_timeout=10 * 60,  # 10 minutes timeout
+                    empty_timeout=10 * 60,
                     max_participants=10,
-                    metadata=json.dumps(request.metadata) if request.metadata else None,
+                    metadata=json.dumps(metadata_payload) if request.metadata else None,
                 )
             )
-            print(f"Room '{request.room_name}' created successfully.")
+            print(f"  Room '{request.room_name}' created successfully. Meeting ID: {request.meeting_id}, User ID: {request.user_id}, Conf Name: {request.conf_name}\n")
         except Exception as e:
             if "already exists" not in str(e):
                 raise HTTPException(status_code=500, detail=f"LiveKit Error: {e}")
 
-        # 🔥 Step 3: Generate token
-        token = (
+        # Generate token
+        jwt_token = (
             api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
             .with_identity(request.participant_identity)
             .with_name(request.participant_name)
@@ -491,8 +499,8 @@ async def create_room_and_token(
                     room=request.room_name,
                 )
             )
-        )
-        jwt_token = token.to_jwt()
+        ).to_jwt()
+        
         return jwt_token
 
     except HTTPException as he:
@@ -503,198 +511,458 @@ async def create_room_and_token(
 
 @router.post("/create-dispatch")
 async def create_dispatch(request: DispatchRequest):
-    lkapi = api.LiveKitAPI()
-    try:
-        dispatch = await lkapi.agent_dispatch.create_dispatch(
-            api.CreateAgentDispatchRequest(
-                agent_name=request.agent_name,
-                room=request.room_name,
-                metadata=json.dumps(request.metadata),
-            )
-        )
-        return {
-            "status": "success",
-            "dispatch_id": dispatch.id,
-            "room": dispatch.room,
-            "agent_name": dispatch.agent_name,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        await lkapi.aclose()
-
-
-
-###############Begin Notetaker-specific routes (with DB integration)
-
-@router.post("/notetaker-dispatch-try")
-async def create_dispatch(
-    request: DispatchRequest,
-    db: Session = Depends(get_notetaker_db),
-):
-    async with LiveKitAPI() as lkapi:
-
-        # List participants in room
-        # res = await lkapi.room.list_participants(ListParticipantsRequest(
-        #     room=request.room_name
-        # ))
-        res = await lkapi.room.get_participant(
-            RoomParticipantIdentity(
-                room=request.room_name,
-                identity=request.agent_name,
-            )
-        )
-        if res.identity:
-            # If participant exists, return their identity
-            return {
-                "status": False,
-                "message": "Agent already exists",
-                "data": res.identity,
+    async with api.LiveKitAPI() as lkapi:
+        try:
+            print(f"Attempting to dispatch agent '{request.agent_name}' to room: {request.room_name} with meeting_id: {request.meeting_id}, user_id: {request.user_id}, conf_name: {request.conf_name}")
+            metadata_payload = {
+                "meeting_id": str(request.meeting_id),
+                "user_id": str(request.user_id),
+                "conf_name": str(request.conf_name),
             }
-
-      
-
-
-@router.post("/notetaker-dispatch")
-async def create_dispatch(
-    request: DispatchRequest,
-    db: Session = Depends(get_notetaker_db),
-):
-
-    lkapi = api.LiveKitAPI()
-    try:
-        # check if participant already exists
-        res = await lkapi.room.get_participant(
-            RoomParticipantIdentity(
-                room=request.room_name,
-                identity=request.agent_name,
-            )
-        )
-        if res.identity:
-            # If participant exists, return their identity
-            return {
-                "status": False,
-                "message": "Agent already exists",
-                "data": res.identity,
-            }
-    except Exception as e:
-        # Handle 'participant does not exist' gracefully
-        if "participant does not exist" in str(e).lower():
-            # Check if there's an active call (by call_id == room_name)
-            existing_call = (
-                db.query(NoteTakerCall)
-                .filter(
-                    NoteTakerCall.call_id == request.room_name,
-                    NoteTakerCall.call_status == "active",
-                )
-                .first()
-            )
-
-            if not existing_call:
-                new_call = NoteTakerCall(
-                    call_id=request.room_name,
-                    start_timestamp=int(time.time() * 1000),
-                    meeting_id=request.meeting_id,
-                    conf_name=request.conf_name,
-                    user_id=request.user_id,   # NEW
-                )
-                db.add(new_call)
-                db.commit()
-                db.refresh(new_call)
-            else:
-                updated = False
-                if request.user_id and existing_call.user_id != request.user_id:
-                    existing_call.user_id = request.user_id
-                    updated = True
-                if request.meeting_id and existing_call.meeting_id != request.meeting_id:
-                    existing_call.meeting_id = request.meeting_id
-                    updated = True
-                if request.conf_name and existing_call.conf_name != request.conf_name:
-                    existing_call.conf_name = request.conf_name
-                    updated = True
-                if updated:
-                    db.add(existing_call)
-                    db.commit()
-                    db.refresh(existing_call)
-
-            # Dispatch the note-taker agent
             dispatch = await lkapi.agent_dispatch.create_dispatch(
                 api.CreateAgentDispatchRequest(
-                    agent_name=request.agent_name,
+                    agent_name="note-taker-agent",
                     room=request.room_name,
+                    metadata=json.dumps(metadata_payload),
                 )
             )
-
+            print(f"  Successfully dispatched agent 'note-taker-agent' to room: {request.room_name} with meeting_id: {request.meeting_id}, user_id: {request.user_id}, conf_name: {request.conf_name}\n")
             return {
                 "status": "success",
                 "dispatch_id": dispatch.id,
                 "room": dispatch.room,
                 "agent_name": dispatch.agent_name,
             }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
-        # For any other error
+
+############### Notetaker-specific routes (with DB integration)
+
+@router.post("/notetaker-dispatch-try")
+async def notetaker_dispatch_check(  # Renamed function
+    request: DispatchRequest,
+    db: Session = Depends(get_notetaker_db),
+):
+    async with LiveKitAPI() as lkapi:
+        try:
+            res = await lkapi.room.get_participant(
+                RoomParticipantIdentity(
+                    room=request.room_name,
+                    identity=request.agent_name,
+                )
+            )
+            if res and res.identity:
+                return {
+                    "status": False,
+                    "message": "Agent already exists",
+                    "data": res.identity,
+                }
+        except Exception:
+            return {
+                "status": True,
+                "message": "Agent not found",
+                "data": None,
+            }
+
+
+
+    
+###################redis flag changes are here with new dispatcher changes###############
+
+import redis
+
+# Redis connection
+redis_client = redis.Redis(
+    host=os.getenv("REDIS_HOST", "localhost"),
+    port=int(os.getenv("REDIS_PORT", 6379)),
+    password=os.getenv("REDIS_PASSWORD", ""),
+    decode_responses=True
+)
+
+
+@router.post("/notetaker-dispatch")
+async def notetaker_dispatch(
+    request: DispatchRequest,
+    db: Session = Depends(get_notetaker_db),
+):
+    try:
+        LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY")
+        LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET")
+        LIVEKIT_URL = os.getenv("LIVEKIT_URL")
+
+        if not (LIVEKIT_API_KEY and LIVEKIT_API_SECRET and LIVEKIT_URL):
+            raise HTTPException(status_code=500, detail="LiveKit credentials not configured")
+
+        async with api.LiveKitAPI(url=LIVEKIT_URL, api_key=LIVEKIT_API_KEY, api_secret=LIVEKIT_API_SECRET) as lkapi:
+            
+            flag_key = f"transcription:active:{request.room_name}"
+            
+            # ============================================
+            # STEP 1: Check if already transcribing
+            # ============================================
+            current_flag = redis_client.get(flag_key)
+            if current_flag == "1":
+                print(f"🎉 Agent already transcribing!")
+                return {
+                    "status": "success",
+                    "room": request.room_name,
+                    "message": "Agent already transcribing"
+                }
+
+            # ============================================
+            # STEP 2: Remove old agent + Ensure room exists
+            # ============================================
+            try:
+                await lkapi.room.remove_participant(
+                    api.RoomParticipantIdentity(
+                        room=request.room_name,
+                        identity=f"note-taker-{request.room_name}"
+                    )
+                )
+                print(f"🗑️ Old agent removed")
+                await asyncio.sleep(3)
+            except:
+                pass
+
+            try:
+                await lkapi.room.create_room(
+                    api.CreateRoomRequest(
+                        name=request.room_name,
+                        empty_timeout=30 * 60,
+                        max_participants=20,
+                    )
+                )
+                print(f"✅ Room: {request.room_name}")
+            except:
+                pass
+
+            # ============================================
+            # STEP 3: Database
+            # ============================================
+            try:
+                existing_call = db.query(NoteTakerCall).filter(
+                    NoteTakerCall.call_id == request.room_name,
+                    NoteTakerCall.call_status == "active"
+                ).first()
+                if not existing_call:
+                    new_call = NoteTakerCall(
+                        call_id=request.room_name,
+                        start_timestamp=int(time.time() * 1000),
+                        meeting_id=request.meeting_id,
+                        conf_name=request.conf_name,
+                        user_id=request.user_id,
+                        call_status="active"
+                    )
+                    db.add(new_call)
+                    db.commit()
+            except:
+                db.rollback()
+
+            # ============================================
+            # STEP 4: Store metadata in Redis
+            # ============================================
+            metadata_dict = {
+                "meeting_id": str(request.meeting_id),
+                "user_id": str(request.user_id),
+                "conf_name": str(request.conf_name),
+            }
+            redis_client.setex(f"meeting:meta:{request.room_name}", 300, json.dumps(metadata_dict))
+
+            # ============================================
+            # STEP 5: Delete old flag + Dispatch
+            # ============================================
+            redis_client.delete(flag_key)
+            
+            metadata_payload = {
+                "meeting_id": str(request.meeting_id),
+                "user_id": str(request.user_id),
+                "conf_name": str(request.conf_name),
+            }
+
+            print(f"🚀 Dispatching to: {request.room_name}")
+            dispatch = await lkapi.agent_dispatch.create_dispatch(
+                api.CreateAgentDispatchRequest(
+                    agent_name="note-taker-agent",
+                    room=request.room_name,
+                    metadata=json.dumps(metadata_payload)
+                )
+            )
+            print(f"   Dispatch ID: {dispatch.id}")
+
+            # ============================================
+            # STEP 6: Wait for Redis flag = 1
+            # ============================================
+            MAX_RETRIES = 10
+            
+            for attempt in range(1, MAX_RETRIES + 1):
+                print(f"\n{'─'*40}")
+                print(f"🔄 Attempt {attempt}/{MAX_RETRIES}")
+                
+                for wait_count in range(15):
+                    await asyncio.sleep(2)
+                    
+                    flag_value = redis_client.get(flag_key)
+                    
+                    if flag_value == "1":
+                        print(f"\n🎉 [{wait_count*2}s] FLAG=1!")
+                        return {
+                            "status": "success",
+                            "dispatch_id": dispatch.id,
+                            "room": request.room_name,
+                            "attempts": attempt,
+                            "message": "Agent transcribing"
+                        }
+                    
+                    print(f"   [{wait_count*2}s] Flag: {flag_value}")
+                
+                # Re-dispatch
+                if redis_client.get(flag_key) != "1":
+                    print(f"   🔄 Re-dispatching...")
+                    
+                    try:
+                        await lkapi.room.remove_participant(
+                            api.RoomParticipantIdentity(
+                                room=request.room_name,
+                                identity=f"note-taker-{request.room_name}"
+                            )
+                        )
+                        await asyncio.sleep(3)
+                    except:
+                        pass
+                    
+                    redis_client.delete(flag_key)
+                    
+                    dispatch = await lkapi.agent_dispatch.create_dispatch(
+                        api.CreateAgentDispatchRequest(
+                            agent_name="note-taker-agent",
+                            room=request.room_name,
+                            metadata=json.dumps(metadata_payload)
+                        )
+                    )
+                    print(f"   🚀 Re-dispatched: {dispatch.id}")
+
+            return {
+                "status": "failed",
+                "room": request.room_name,
+                "message": "Failed after max attempts"
+            }
+
+    except Exception as e:
+        print("ERROR:", str(e))
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
+#####old code has been commented out for reference, new code above has improved logic with retries and flag checks
+# @router.get("/notetaker/call-list")
+# def get_calls(user_id: Optional[str] = None, db: Session = Depends(get_notetaker_db)):
+#     try:
+#         query = db.query(NoteTakerCall)
+#         if user_id:
+#             query = query.filter(NoteTakerCall.user_id == user_id)
+
+#         calls = query.all()
+#         if not calls:
+#             return format_response(
+#                 status=False,
+#                 message="No calls found",
+#                 errors=[{"field": "calls", "message": "No calls found"}],
+#             )
+
+#         return format_response(
+#             status=True,
+#             message="Calls retrieved successfully",
+#             data=[
+#                 {
+#                     "id": c.id,
+#                     "call_type": c.call_type,
+#                     "call_id": c.call_id,
+#                     "call_status": c.call_status,
+#                     "start_timestamp": c.start_timestamp,
+#                     "end_timestamp": c.end_timestamp,
+#                     "duration_ms": c.duration_ms,
+#                     "recording_url": c.recording_url,
+#                     "call_analysis": c.call_analysis,
+#                     "created_at": c.created_at,
+#                     "updated_at": c.updated_at,
+#                     "meeting_id": c.meeting_id,
+#                     "conf_name": c.conf_name,
+#                     "user_id": c.user_id,   # NEW
+#                 }
+#                 for c in calls
+#             ],
+#         )
+
+
+#     except Exception as e:
+#         return format_response(
+#             status=False,
+#             message="Internal Server Error",
+#             errors=[{"field": "server", "message": str(e)}],
+#         )
+  
+  
+
+#new changes here for filtering by summary_id and status, also added error handling for invalid status values and no calls found scenarios
+
+
+from fastapi import APIRouter, Depends, Query,Request
+from sqlalchemy.orm import Session
+from typing import Optional
+import math
 
 @router.get("/notetaker/call-list")
-def get_calls(user_id: Optional[str] = None, db: Session = Depends(get_notetaker_db)):
+def get_calls(
+    request: Request,
+    user_id: Optional[str] = None,
+    order: str = Query("desc", enum=["asc", "desc"]),
+    search: Optional[str] = None,
+    call_type: Optional[str] = None,
+    page: int = 1,
+    limit: int = 20,
+    db: Session = Depends(get_notetaker_db),
+):
+    token = request.headers.get("Authorization")
+    # print(f"\n\nSSSSSSSSSSSSSSSSStoken : {token}\n\n")
+    # url="https://meeting.webvio.in/backend-php/api/user"
+    headers = {
+        "Authorization": f"Bearer {token}"
+    }
+    response = requests.get(VALIDATION_API_URL, headers=headers)
+    status_code = response.status_code
+    resp_message = response.json().get("message", response.json().get("error"))  
+    print(f"status_code: {status_code} ||  Message: {resp_message}\n")
+    ##Add here validation for if user id is blank or not provided then return response 401 unauthorized with message "User ID is required to fetch calls"
+    if not user_id:
+        return JSONResponse(
+        status_code=401,
+        content=format_response(
+            status=False,
+            message="User ID is required to fetch calls",
+            errors=[
+                {
+                    "field": "user_id",
+                    "message": "User ID is required"
+                }
+            ],
+        )
+    ) 
+        
+    # in this scenario if have the status code !=200 then return response 401 unauthorized with message "Invalid or expired token"
+    elif response.status_code != 200:
+        return JSONResponse(status_code=status_code, content=format_response(
+            status=False,
+            message=resp_message or "Invalid or expired token",
+
+        ))  
+            
     try:
         query = db.query(NoteTakerCall)
-        if user_id:
-            query = query.filter(NoteTakerCall.user_id == user_id)
 
-        calls = query.all()
-        if not calls:
-            return format_response(
-                status=False,
-                message="No calls found",
-                errors=[{"field": "calls", "message": "No calls found"}],
+        # Filter by user_id
+        if user_id:
+            # query = query.filter(NoteTakerCall.user_id == user_id)
+            query = query.filter(
+                NoteTakerCall.user_id == user_id,
+                NoteTakerCall.call_analysis.isnot(None)
             )
+
+        # Filter by call_type
+        if call_type:
+            query = query.filter(NoteTakerCall.call_type == call_type)
+
+        # Search by meeting/conference name
+        if search:
+            query = query.filter(
+                NoteTakerCall.conf_name.ilike(f"%{search}%")
+            )
+
+        # Ordering
+        order = order.lower()
+        if order == "asc":
+            query = query.order_by(NoteTakerCall.created_at.asc())
+        else:
+            query = query.order_by(NoteTakerCall.created_at.desc())
+
+        # Total count before pagination
+        total_records = query.count()
+
+        # Pagination calculations
+        offset = (page - 1) * limit
+        total_pages = math.ceil(total_records / limit)
+
+        # Fetch paginated data
+        calls = query.offset(offset).limit(limit).all()
 
         return format_response(
             status=True,
             message="Calls retrieved successfully",
-            data=[
-                {
-                    "id": c.id,
-                    "call_type": c.call_type,
-                    "call_id": c.call_id,
-                    "call_status": c.call_status,
-                    "start_timestamp": c.start_timestamp,
-                    "end_timestamp": c.end_timestamp,
-                    "duration_ms": c.duration_ms,
-                    "recording_url": c.recording_url,
-                    "call_analysis": c.call_analysis,
-                    "created_at": c.created_at,
-                    "updated_at": c.updated_at,
-                    "meeting_id": c.meeting_id,
-                    "conf_name": c.conf_name,
-                    "user_id": c.user_id,   # NEW
-                }
-                for c in calls
-            ],
+            data={
+                "pagination": {
+                    "current_page": page,
+                    "limit": limit,
+                    "total_records": total_records,
+                    "total_pages": total_pages,
+                    "has_next": page < total_pages,
+                    "has_previous": page > 1,
+                },
+                "records": [
+                    {
+                        "id": c.id,
+                        "call_type": c.call_type,
+                        "call_id": c.call_id,
+                        "call_status": c.call_status,
+                        "start_timestamp": c.start_timestamp,
+                        "end_timestamp": c.end_timestamp,
+                        "duration_ms": c.duration_ms,
+                        # "recording_url": c.recording_url,
+                        # "call_analysis": c.call_analysis,
+                        "created_at": c.created_at,
+                        "updated_at": c.updated_at,
+                        "meeting_id": c.meeting_id,
+                        "conf_name": c.conf_name,
+                        "user_id": c.user_id,
+                    }
+                    for c in calls
+                ],
+            },
         )
-
 
     except Exception as e:
         return format_response(
             status=False,
             message="Internal Server Error",
-            errors=[{"field": "server", "message": str(e)}],
+            errors=[{
+                "field": "server",
+                "message": str(e)
+            }],
         )
-  
+
+
 @router.post("/notetaker/call-list")
 def get_calls(payload: CallListRequest, db: Session = Depends(get_notetaker_db)):
     try:
+    
         query = db.query(NoteTakerCall)
 
-        if payload.summary_id:  # ✅ If summary_id is passed, filter by id
+        if payload.summary_id:
             query = query.filter(NoteTakerCall.id == payload.summary_id)
-        elif payload.user_id:  # ✅ Otherwise, filter by user_id
+        elif payload.user_id:
             query = query.filter(NoteTakerCall.user_id == payload.user_id)
+        
+        # ✅ Optional: Add status filter
+        if payload.status:
+            if payload.status not in ["active", "paused", "ended"]:
+                return format_response(
+                    status=False,
+                    message="Invalid status value",
+                    errors=[{"field": "status", "message": "Status must be 'active', 'paused', or 'ended'"}],
+                )
+            query = query.filter(NoteTakerCall.call_status == payload.status)
 
         calls = query.all()
+     
         if not calls:
             return format_response(
                 status=False,
@@ -732,54 +1000,829 @@ def get_calls(payload: CallListRequest, db: Session = Depends(get_notetaker_db))
             message="Internal Server Error",
             errors=[{"field": "server", "message": str(e)}],
         )
-        
+    
+    
+##In this i need to add new show-notes api end point in which we get call_id as path parameter then give return data same call-list also apply validation and autherization
 
-
-@router.post("/notetaker/calls")
-def get_calls_by_call_id(
-    request: CallIDRequest, db: Session = Depends(get_notetaker_db)
+@router.get("/notetaker/show-notes/{call_id}")
+def show_notes(
+    request: Request,
+    call_id: str,
+    db: Session = Depends(get_notetaker_db),
 ):
-    query = db.query(NoteTakerCall)
-
-    if request.roomid:
-        query = query.filter(NoteTakerCall.call_id == request.roomid)
-    if request.user_id:
-        query = query.filter(NoteTakerCall.user_id == request.user_id)
-
-    call_records = query.all()
-
-    if not call_records:
-        raise HTTPException(
-            status_code=404, detail="No calls found with the given filters."
+    # Token authentication
+    token = request.headers.get("Authorization")
+    
+    # Remove 'Bearer ' prefix if it exists
+    if token and token.startswith("Bearer "):
+        token = token.replace("Bearer ", "")
+    
+    if not token:
+        return JSONResponse(
+            status_code=401,
+            content=format_response(
+                status=False,
+                message="Authorization token is required",
+                errors=[{
+                    "field": "Authorization",
+                    "message": "Token is missing"
+                }]
+            )
+        )
+    
+    headers = {
+        "Authorization": f"Bearer {token}"  # Now token doesn't have 'Bearer ' prefix
+    }
+    response = requests.get(VALIDATION_API_URL, headers=headers)
+    status_code = response.status_code
+    resp_message = response.json().get("message", response.json().get("error"))  
+    print(f"status_code: {status_code} ||  Message: {resp_message}\n")
+    
+    # Validate token response
+    if response.status_code != 200:
+        return JSONResponse(
+            status_code=status_code, 
+            content=format_response(
+                status=False,
+                message=resp_message or "Invalid or expired token",
+            )
+        )
+    
+    # Validate call_id (though FastAPI ensures it's not empty as path param)
+    if not call_id or call_id.strip() == "":
+        return JSONResponse(
+            status_code=400,
+            content=format_response(
+                status=False,
+                message="Call ID is required",
+                errors=[{
+                    "field": "call_id",
+                    "message": "Call ID cannot be empty"
+                }]
+            )
+        )
+    
+    try:
+        # Fetch the call by call_id directly
+        call = db.query(NoteTakerCall).filter(
+            NoteTakerCall.id == call_id,  # Direct match with path parameter
+            NoteTakerCall.call_analysis.isnot(None)
+        ).first()
+        
+        # Check if call exists
+        if not call:
+            return JSONResponse(
+                status_code=404,
+                content=format_response(
+                    status=False,
+                    message="Call not found",
+                    errors=[{
+                        "field": "call_id",
+                        "message": f"No call found with ID: {call_id}"
+                    }]
+                )
+            )
+        
+        # Return the notes/call details
+        return format_response(
+            status=True,
+            message="Notes retrieved successfully",
+            data={
+                "id": call.id,
+                "call_type": call.call_type,
+                "call_id": call.call_id,
+                "call_status": call.call_status,
+                "start_timestamp": call.start_timestamp,
+                "end_timestamp": call.end_timestamp,
+                "duration_ms": call.duration_ms,
+                "recording_url": call.recording_url,
+                "call_analysis": call.call_analysis,  # This contains the notes
+                "created_at": call.created_at,
+                "updated_at": call.updated_at,
+                "meeting_id": call.meeting_id,
+                "conf_name": call.conf_name,
+                "user_id": call.user_id,
+            },
+        )
+        
+    except Exception as e:
+        return format_response(
+            status=False,
+            message="Internal Server Error",
+            errors=[{
+                "field": "server",
+                "message": str(e)
+            }],
         )
 
-    return {
-        "status": True,
-        "message": "Successfully retrieved notes!",
-        "data": [
-            {
-                "id": c.id,
-                "call_type": c.call_type,
-                "call_id": c.call_id,
-                "call_status": c.call_status,
-                "start_timestamp": c.start_timestamp,
-                "end_timestamp": c.end_timestamp,
-                "duration_ms": c.duration_ms,
-                "recording_url": c.recording_url,
-                "call_analysis": c.call_analysis,
-                "created_at": c.created_at,
-                "updated_at": c.updated_at,
-                "meeting_id": c.meeting_id,
-                "conf_name": c.conf_name,
-                "user_id": c.user_id,   # NEW
+@router.get("/notetaker/health")
+def notetaker_health_check(
+    db: Session = Depends(get_notetaker_db),
+    authorization: str = Header(..., description="Bearer token")
+):
+    """Check if note-taker system is healthy"""
+    try:
+        # Check if there are any recent calls (last 5 minutes)
+        five_min_ago = int((time.time() - 300) * 1000)
+        recent_calls = db.query(NoteTakerCall).filter(
+            NoteTakerCall.start_timestamp >= five_min_ago
+        ).count()
+        
+        # Check for any stuck 'pending' calls (older than 1 hour)
+        one_hour_ago = int((time.time() - 3600) * 1000)
+        pending_calls = db.query(NoteTakerCall).filter(
+            NoteTakerCall.call_analysis['status'].astext == 'pending',
+            NoteTakerCall.start_timestamp < one_hour_ago
+        ).count()
+        
+        return format_response(
+            status=True,
+            message="Note-taker system healthy",
+            data={
+                "recent_calls_5min": recent_calls,
+                "stuck_pending_calls": pending_calls,
+                "consumer_running": pending_calls == 0,  # Approximate
             }
-            for c in call_records
-        ],
-    }
+        )
+    except Exception as e:
+        return format_response(
+            status=False,
+            message="Health check failed",
+            errors=[{"field": "server", "message": str(e)}],
+        )
+
+# RabbitMQ connection and message processing would go here (not shown for brevity)
+
+@router.post("/notetaker/webhook/{call_id}")
+async def notetaker_webhook(
+    call_id: str,
+    payload: dict = Body(...),
+    db: Session = Depends(get_notetaker_db),
+):
+    """
+    Webhook endpoint that consumer can call when analysis is complete
+    """
+    try:
+        call = db.query(NoteTakerCall).filter(NoteTakerCall.id == call_id).first()
+        if not call:
+            return format_response(status=False, message="Call not found")
+        
+        # Update call with webhook data
+        call.call_analysis = payload.get("analysis", call.call_analysis)
+        call.call_status = "completed"
+        db.commit()
+        
+        # You can also trigger notifications here (email, SMS, etc.)
+        
+        return format_response(status=True, message="Webhook processed")
+    except Exception as e:
+        return format_response(status=False, message=str(e))
+
+
+########################Add for analysis service integration############################
+
+# ==================== RE-ANALYSIS ENDPOINTS ====================
+@router.post("/notetaker/reanalyze")
+def reanalyze_transcript(
+    request: ReanalyzeRequest,
+    db: Session = Depends(get_notetaker_db)
+):
+    """
+    Re-analyze transcript using OpenAI and store in separate table
+    """
+    max_version = int(os.getenv("MAX_REANALYSIS_VERSIONS", 5))
+    existing_reanalyses_count = db.query(NoteTakerReanalysis).filter(
+        NoteTakerReanalysis.original_call_id == request.call_id
+    ).count()
+    
+    
+    if existing_reanalyses_count >= max_version:
+        return format_response(
+            status=False,
+            message=f"Limit reached: Maximum {max_version} re-analyses allowed per call. Please remove an older version to continue",
+            errors=[{
+                "field": "reanalysis_limit",
+                "message": f"Limit: {max_version} versions per call",
+                "current_versions": existing_reanalyses_count
+            }]
+        )
+    
+    start_time = time.time()
+    print(f"Re-analysis request received for call_id: {request.call_id} by user_id: {request.user_id}")
+    try:
+        # Fetch original call
+        original_call = db.query(NoteTakerCall).filter(
+            NoteTakerCall.id == request.call_id
+        ).first()
+        participants_list = getattr(original_call, "participants_list", [])
+        
+        if not original_call:
+            return format_response(
+                status=False,
+                message="Call not found",
+                errors=[{"field": "call_id", "message": f"No call found with id: {request.call_id}"}]
+            )
+        
+        # Verify user access
+        if request.user_id and original_call.user_id != request.user_id:
+            return format_response(
+                status=False,
+                message="Unauthorized",
+                errors=[{"field": "user_id", "message": "You don't have access to this call"}]
+            )
+        
+        # Extract raw transcript
+        if not original_call.call_analysis:
+            return format_response(
+                status=False,
+                message="No analysis data found",
+                errors=[{"field": "transcript", "message": "Call analysis data is missing"}]
+            )
+        
+        raw_transcript = original_call.call_analysis.get("transcript_dict", [])
+        print(f"Original transcript length: {len(raw_transcript)} lines")
+        if not raw_transcript:
+            return format_response(
+                status=False,
+                message="No transcript found",
+                errors=[{"field": "transcript", "message": "Transcript data is missing"}]
+            )
+        
+        # Get next version number
+        last_reanalysis = db.query(NoteTakerReanalysis).filter(
+            NoteTakerReanalysis.original_call_id == request.call_id
+        ).order_by(NoteTakerReanalysis.reanalysis_version.desc()).first()
+        
+        next_version = (last_reanalysis.reanalysis_version + 1) if last_reanalysis else 1
+        
+        # Convert transcript to text
+        transcript_text = "\n".join(raw_transcript)
+        
+        # Call OpenAI
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        
+        # UPDATED PROMPT with stronger action item grouping rules and JSON formatting
+        prompt = f"""
+You are an expert AI meeting assistant trained to generate structured, business-quality meeting summaries.
+
+Analyze the following meeting transcript and return a structured JSON output.
+
+Transcript:
+{transcript_text}
+
+Instructions:
+- Understand context even if sentences are incomplete or noisy
+- Convert conversational language into clear professional insights
+- Focus only on meaningful business outcomes (decisions, problems, solutions, ownership)
+- Avoid repetition across sections (no duplicate insights anywhere)
+- Be concise, precise, and high-signal
+- Do NOT copy transcript text directly
+
+Extraction Rules (STRICT):
+
+1. Meeting Purpose
+- Must be a single, clear, unambiguous sentence
+- Clearly answer: why the meeting happened and what outcome was expected
+- Avoid generic phrases like "discussion" or "catch-up"
+- Extract this SOLELY from the transcript content - do not invent or use placeholder values
+
+2. Key Takeaways
+- 3 to 5 unique insights only
+- Each point must add new information
+- Do NOT repeat information from decisions, topics, blockers, or next steps
+- Each takeaway must be high-level and outcome-focused, not task-level
+- Extract these SOLELY from the transcript content
+
+3. Decisions
+- Include only finalized and high-impact decisions
+- Exclude discussions without clear outcomes
+- Avoid repeating takeaways or topics
+- Each decision must have clear business impact
+- Extract these SOLELY from the transcript content
+
+4. Topics (CRITICAL - Must include person/team ownership)
+- Group discussions from the transcript into meaningful business topics
+- Topics must be outcome-focused (what was discussed, not just who discussed)
+- Avoid using only team names as titles unless necessary
+- Topic titles must be derived from actual discussion subjects in the transcript
+
+Each topic must include:
+    - title: short, specific, and outcome-focused (derive from what was actually discussed)
+    - problem: issue discussed (include person/team name if mentioned in transcript, else null)
+    - solution: outcome or conclusion (include who owns/contributes based on transcript)
+    - rationale: why this solution/decision was chosen (based on transcript discussion)
+    - postponed_items: include only explicitly postponed items mentioned in transcript, else []
+
+5. Action Items (CRITICAL RULES - No person left behind):
+ **You have the all participants list {participants_list}, mentioned all update into action item do not missed any one to update into action item if they have any task to do, and make sure every participant appears once in action item if they have task to do .**
+- Identify EVERY person mentioned in the transcript who has assigned tasks or responsibilities
+- Create ONE action item per person (owner)
+- If a person has MULTIPLE tasks mentioned in transcript, combine ALL their tasks into a SINGLE action item
+- The 'task' field must contain a comprehensive list of ALL responsibilities for that owner from the transcript
+- Use format: comma separated within the single task field
+- DO NOT create separate action items for the same owner
+- Include owners even if they have only one task
+- If owner name is not mentioned in transcript, use their role or "unassigned"
+- Priority assignment rules (based on transcript context):
+    - high → urgent / blockers / critical path / impacts delivery date (as mentioned in transcript)
+    - medium → important but not urgent / standard feature work
+    - low → minor optimizations / nice-to-have / no clear deadline mentioned
+- Include deadline ONLY if explicitly mentioned in transcript (date or relative like "tomorrow")
+
+Action item structure:
+{{
+    "owner": "person's name or role from transcript",
+    "task": "Task from transcript, Another task from transcript",
+    "priority": "high | medium | low",
+    "deadline": "due date if mentioned in transcript, else null"
+}}
+
+6. Blockers
+- Only include issues from transcript that impact delivery, timelines, or dependencies
+- Exclude minor or already resolved concerns
+- Each blocker must include implicit or explicit impact if mentioned in transcript
+- Format as clear, actionable statements extracted from transcript
+
+7. Next Steps (CRITICAL - Must follow exact Name: Content format):
+- Include only the MOST IMPORTANT forward-looking, project-level actions mentioned in transcript (maximum 5-6 items)
+- Define what happens next based on transcript (sequence or directional guidance)
+- Do NOT repeat action items or tasks from action_items section
+- **FORMAT REQUIREMENT**: Each next step must be written as "Name: Content"
+- Name should be person's name or team name as mentioned in transcript (e.g., name from transcript + colon)
+- Content should clearly state the action and timeline if mentioned in transcript
+- If multiple people responsible in transcript, combine as "Person1 & Person2: Content"
+- If no person mentioned in transcript, infer from context or use team name
+- If multiple steps for same person from transcript, merge into one "Name: Content" entry with semicolons
+- Do NOT use simple dash lists - enforce "Name: Content" format strictly
+- Extract these SOLELY from the transcript - do not invent next steps
+
+8. Meeting Tone & Observations
+- Keep it short and insightful (2–4 points max)
+- Focus on behavior observed in transcript: accountability, urgency, alignment, concerns, decision quality
+- Include positive observations if warranted based on transcript (e.g., "clear ownership", "decisive resolution")
+- Derive these from conversational cues in the transcript
+
+9. Transcript Snapshot (Cleaned Highlights)
+- 3–5 impactful, rephrased statements from transcript
+- Include speaker attribution as mentioned in transcript (e.g., "Name from transcript: Statement")
+- Focus on commitments, risks, or key statements from transcript
+- Do NOT duplicate content from other sections
+- Rephrase into professional language without changing meaning
+
+10. Transcript Dict (Array of Key Statements)
+- Include 2-3 important raw or lightly cleaned statements per major topic from transcript
+- Preserve speaker attribution as in transcript
+- Keep original meaning intact
+- Useful for fallback context
+
+JSON Schema:
+{{
+"meeting_purpose": "string",
+"key_takeaways": ["..."],
+"decisions": ["..."],
+"topics": [
+    {{
+    "title": "string",
+    "problem": "string or null",
+    "solution": "string",
+    "rationale": "string",
+    "postponed_items": ["..."]
+    }}
+],
+"action_items": [
+    {{
+    "owner": "string",
+    "task": "string",
+    "priority": "high | medium | low",
+    "deadline": "string or null"
+    }}
+],
+"blockers": ["..."],
+"next_steps": ["..."],
+"meeting_tone": ["..."],
+"transcript_highlights": ["..."],
+"transcript_dict": ["..."]
+}}
+
+CRITICAL JSON FORMATTING RULES (MUST FOLLOW):
+- All string values MUST escape double quotes with backslash: He said \"hello\"
+- No literal newlines inside string values - use \\n instead
+- No control characters in strings
+- No trailing commas in arrays or objects
+- All property names MUST be double-quoted
+- ALL strings MUST be properly terminated with closing quotes
+- Do NOT include markdown code blocks or any text outside the JSON object
+
+Final Rules (MUST FOLLOW):
+- NO hardcoded or static example values from these instructions - extract EVERYTHING from the transcript
+- No repeated or paraphrased information across any sections
+- Each section must add unique value based on transcript content
+- Merge duplicate insights intelligently (by meaning, not just wording)
+- Prefer clarity over quantity
+- Keep output concise and structured (no fluff)
+- Output valid JSON only (no extra text, no markdown, no explanation)
+- ENSURE every person with tasks from transcript gets an action item - no one is left out
+- ENSURE next_steps array has each element in EXACT "Name: Content" format only
+- ENSURE topics include person/team ownership from transcript in problem and solution fields
+- ENSURE no generic titles like "Discussion" or "Updates" - use specific outcome-focused titles from transcript
+- ENSURE rationale explains WHY based on transcript discussion, not just WHAT
+
+Quality Checklist Before Output:
+[ ] All content extracted from transcript - no invented or placeholder values
+[ ] Meeting purpose answers "why" and "expected outcome" based on transcript
+[ ] Key takeaways don't repeat decisions or topics
+[ ] Each topic has title, problem, solution, rationale, postponed_items from transcript
+[ ] Action items have one owner per entry with all tasks combined from transcript
+[ ] Next steps follow "Name: Content" format strictly and come from transcript
+[ ] No duplicate information across sections
+[ ] Valid JSON only with proper escaping
+"""
+        
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Fixed model name
+            messages=[
+                {"role": "system", "content": "You are a meeting analyst. Always return valid JSON only. CRITICAL: Escape all double quotes inside strings with backslash. No markdown, no extra text, just pure JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_completion_tokens=2000,
+            response_format={"type": "json_object"}
+        )
+        
+        # Get raw response
+        raw_response = response.choices[0].message.content
+        
+        # Function to clean and parse JSON
+        def clean_and_parse_json(raw_json_str):
+            """Attempt to clean and parse malformed JSON from LLM"""
+            import re
+            
+            # Remove markdown code blocks if present
+            raw_json_str = re.sub(r'^```json\s*', '', raw_json_str)
+            raw_json_str = re.sub(r'^```\s*', '', raw_json_str)
+            raw_json_str = re.sub(r'\s*```$', '', raw_json_str)
+            
+            # Remove any non-JSON text before/after
+            json_match = re.search(r'\{.*\}', raw_json_str, re.DOTALL)
+            if json_match:
+                raw_json_str = json_match.group()
+            
+            # Remove control characters
+            cleaned = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', raw_json_str)
+            
+            # Try direct parse first
+            try:
+                return json.loads(cleaned)
+            except json.JSONDecodeError:
+                pass
+            
+            # Fix common JSON issues
+            try:
+                # Fix unterminated strings by adding missing quotes
+                lines = cleaned.split('\n')
+                fixed_lines = []
+                in_string = False
+                for line in lines:
+                    new_line = []
+                    i = 0
+                    while i < len(line):
+                        char = line[i]
+                        if char == '"' and (i == 0 or line[i-1] != '\\'):
+                            in_string = not in_string
+                            new_line.append(char)
+                        elif char == '\n' and in_string:
+                            new_line.append('\\n')
+                        elif char == '"' and in_string and (i + 1 < len(line) and line[i+1] not in [',', '}', ']', ':', ' ']):
+                            # Escaping unescaped quotes
+                            new_line.append('\\"')
+                        else:
+                            new_line.append(char)
+                        i += 1
+                    fixed_lines.append(''.join(new_line))
+                
+                cleaned = '\n'.join(fixed_lines)
+                
+                # Fix odd number of quotes
+                if cleaned.count('"') % 2 != 0:
+                    # Find last position and add quote
+                    cleaned = cleaned + '"'
+                
+                return json.loads(cleaned)
+            except json.JSONDecodeError as e:
+                # Try json_repair if available (optional dependency)
+                try:
+                    import json_repair
+                    return json_repair.repair_json(cleaned, return_objects=True)
+                except ImportError:
+                    pass
+                except Exception:
+                    pass
+                
+                raise e
+        
+        # Parse response with cleaning
+        try:
+            result = clean_and_parse_json(raw_response)
+        except json.JSONDecodeError as e:
+            # Log error details for debugging
+            print(f"Raw response (first 500 chars): {raw_response[:500]}")
+            print(f"Raw response (last 500 chars): {raw_response[-500:]}")
+            print(f"JSON parse error: {str(e)}")
+            return format_response(
+                status=False,
+                message=f"Failed to parse AI response: {str(e)}",
+                errors=[{"field": "llm", "message": str(e)}]
+            )
+        
+        # Process action items with improved grouping and deduplication
+        action_items = []
+        raw_actions = result.get("action_items", [])
+        
+        if isinstance(raw_actions, list):
+            # First, collect all action items by owner
+            owner_map = {}
+            
+            for item in raw_actions:
+                if isinstance(item, dict):
+                    owner = _safe_text(item.get("owner", "unassigned")).strip().lower()
+                    task = _safe_text(item.get("task", ""))
+                    priority = _safe_text(item.get("priority", "medium"))
+                    deadline = _safe_text(item.get("deadline")) if item.get("deadline") else None
+                    
+                    if owner not in owner_map:
+                        owner_map[owner] = {
+                            "owner": _safe_text(item.get("owner", "unassigned")),  # Keep original case
+                            "tasks": [],
+                            "priority": priority,
+                            "deadline": deadline,
+                            "original_priority": priority
+                        }
+                    
+                    # Add task to the owner's task list
+                    if task:
+                        owner_map[owner]["tasks"].append(task)
+                    
+                    # Update priority to highest if multiple tasks have different priorities
+                    if priority == "high" or owner_map[owner]["priority"] == "high":
+                        owner_map[owner]["priority"] = "high"
+                    elif priority == "medium" and owner_map[owner]["priority"] not in ["high"]:
+                        owner_map[owner]["priority"] = "medium"
+            
+            # Convert owner_map to final action items list
+            for owner_key, owner_data in owner_map.items():
+                # Combine all tasks into one task field with numbering
+                if len(owner_data["tasks"]) > 1:
+                    combined_tasks = []
+                    for idx, task in enumerate(owner_data["tasks"], 1):
+                        combined_tasks.append(f"{idx}. {task}")
+                    final_task = "; ".join(combined_tasks)
+                else:
+                    final_task = owner_data["tasks"][0] if owner_data["tasks"] else ""
+                
+                action_items.append({
+                    "owner": owner_data["owner"],
+                    "task": final_task,
+                    "priority": owner_data["priority"],
+                    "deadline": owner_data["deadline"]
+                })
+            
+            # If no action items found from AI, try to extract from transcript as fallback
+            if not action_items:
+                print("No action items found in AI response, attempting fallback extraction")
+                action_items = extract_action_items_fallback(transcript_text)
+        
+        # Process topics with new structure
+        topics_list = result.get("topics", [])
+        
+        if not isinstance(topics_list, list):
+            topics_list = []
+        
+        # Validate and clean each topic object with new fields
+        validated_topics = []
+        for topic in topics_list:
+            if isinstance(topic, dict):
+                validated_topic = {
+                    "title": _safe_text(topic.get("title", "")),
+                    "problem": _safe_text(topic.get("problem")) if topic.get("problem") else None,
+                    "solution": _safe_text(topic.get("solution", "")),
+                    "rationale": _safe_text(topic.get("rationale", "")),
+                    "postponed_items": topic.get("postponed_items", []) if isinstance(topic.get("postponed_items", []), list) else []
+                }
+                validated_topics.append(validated_topic)
+        
+        # Create reanalysis data with updated structure
+        reanalysis_data = {
+            "meeting_purpose": _safe_text(result.get("meeting_purpose") or result.get("purpose") or ""),
+            "key_takeaways": dedup_list(_coerce_list(result.get("key_takeaways") or result.get("key_points") or [])),
+            "decisions": dedup_list(_coerce_list(result.get("decisions") or [])),
+            "topics": validated_topics,
+            "action_items": action_items,  # Now properly grouped by owner
+            "blockers": dedup_list(_coerce_list(result.get("blockers") or result.get("negative_points") or [])),
+            "next_steps": dedup_list(_coerce_list(result.get("next_steps") or [])),
+            "meeting_tone": dedup_list(_coerce_list(result.get("meeting_tone") or [])),
+            "transcript_highlights": dedup_list(_coerce_list(result.get("transcript_highlights") or [])),
+            "transcript_dict": raw_transcript,
+        }
+        
+        # Calculate processing time
+        processing_time_ms = int((time.time() - start_time) * 1000)
+        
+        # Save ONLY to reanalysis table
+        reanalysis_record = NoteTakerReanalysis(
+            original_call_id=original_call.id,
+            user_id=request.user_id or original_call.user_id,
+            reanalysis_data=reanalysis_data,
+            reanalysis_version=next_version,
+            reanalysis_reason=request.reanalysis_reason,
+            reanalysis_triggered_at=int(time.time() * 1000),
+            status="completed",
+            analysis_params={"model": "gpt-4o-mini", "temperature": 0.3},
+            processing_time_ms=processing_time_ms
+        )
+        
+        db.add(reanalysis_record)
+        db.commit()
+        db.refresh(reanalysis_record)
+        
+        return format_response(
+            status=True,
+            message="Re-analysis completed successfully",
+            data={
+                "reanalysis_id": reanalysis_record.id,
+                "original_call_id": original_call.id,
+                "reanalysis_version": next_version,
+                "processing_time_ms": processing_time_ms,
+                "analysis": reanalysis_data,
+                "action_items_count": len(action_items),
+                "unique_owners": [item["owner"] for item in action_items]
+            }
+        )
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse AI response: {str(e)}")
+        return format_response(
+            status=False,
+            message=f"Failed to parse AI response: {str(e)}",
+            errors=[{"field": "llm", "message": str(e)}]
+        )
+    except Exception as e:
+        logger.error(f"Re-analysis failed: {str(e)}")
+        return format_response(
+            status=False,
+            message="Failed to re-analyze transcript",
+            errors=[{"field": "server", "message": str(e)}]
+        )
 
 
 
+def extract_action_items_fallback(transcript_text: str) -> list:
+    """
+    Fallback function to extract action items using a simpler prompt
+    when the main extraction doesn't find any action items
+    """
+    try:
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        
+        fallback_prompt = f"""
+        Extract ALL action items from this transcript.
+        
+        CRITICAL RULES:
+        1. Identify EVERY person mentioned with assigned tasks
+        2. Create ONE action item per person
+        3. Combine ALL tasks for the same person into ONE action item
+        4. Format tasks as numbered list within the task field
+        
+        Transcript:
+        {transcript_text[:8000]}  # Limit length for fallback
+        
+        Return JSON with action_items array only:
+        {{
+            "action_items": [
+                {{
+                    "owner": "person name",
+                    "task": "1. First task; 2. Second task",
+                    "priority": "high/medium/low",
+                    "deadline": "date or null"
+                }}
+            ]
+        }}
+        """
+        
+        response = client.chat.completions.create(
+            model="gpt-5.4-mini",
+            messages=[
+                {"role": "system", "content": "Extract action items per person. One action item per owner only."},
+                {"role": "user", "content": fallback_prompt}
+            ],
+            temperature=0.3,
+            max_completion_tokens=2500,
+            response_format={"type": "json_object"}
+        )
+        
+        result = json.loads(response.choices[0].message.content)
+        return result.get("action_items", [])
+        
+    except Exception as e:
+        print(f"Fallback extraction failed: {str(e)}")
+        return []
 
+
+# Helper function to safely coerce values (add this if not already present)
+def _coerce_list(value):
+    """Convert value to list if it's not already"""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        return [value]
+    return list(value) if hasattr(value, '__iter__') else [value]
+
+
+@router.get("/notetaker/reanalysis/history/{call_id}")
+def get_reanalysis_history(
+    call_id: str,
+    limit: int = 10,
+    db: Session = Depends(get_notetaker_db)
+):
+    """Get all re-analysis versions for a call"""
+    reanalyses = db.query(NoteTakerReanalysis).filter(
+        NoteTakerReanalysis.original_call_id == call_id
+    ).order_by(NoteTakerReanalysis.reanalysis_version.desc()).limit(limit).all()
+    
+    if not reanalyses:
+        return format_response(
+            status=True,
+            message="No reanalysis history found",
+            data={"total": 0, "reanalyses": []}
+        )
+    
+    return format_response(
+        status=True,
+        message="History retrieved successfully",
+        data={
+            "total": len(reanalyses),
+            "reanalyses": [
+                {
+                    "id": r.id,
+                    "version": r.reanalysis_version,
+                    "reason": r.reanalysis_reason,
+                    "created_at": r.created_at,
+                    "status": r.status,
+                    "summary": r.reanalysis_data.get("meeting_purpose", "")[:100],
+                    "key_takeaways_count": len(r.reanalysis_data.get("key_takeaways", [])),
+                    "action_items_count": len(r.reanalysis_data.get("action_items", [])),
+                    "owners": [item.get("owner") for item in r.reanalysis_data.get("action_items", [])]
+                }
+                for r in sorted(reanalyses, key=lambda r: r.reanalysis_version)
+            ]
+        }
+    )
+
+
+@router.get("/notetaker/reanalysis/details/{reanalysis_id}")
+def get_reanalysis_details(
+    reanalysis_id: int,
+    db: Session = Depends(get_notetaker_db)
+):
+    """Get complete re-analysis details by ID"""
+    reanalysis = db.query(NoteTakerReanalysis).filter(
+        NoteTakerReanalysis.id == reanalysis_id
+    ).first()
+    
+    if not reanalysis:
+        return format_response(
+            status=False,
+            message="Reanalysis record not found",
+            errors=[{"field": "reanalysis_id", "message": "Invalid ID"}]
+        )
+    
+    return format_response(
+        status=True,
+        message="Details retrieved successfully",
+        data={
+            "id": reanalysis.id,
+            "original_call_id": reanalysis.original_call_id,
+            "version": reanalysis.reanalysis_version,
+            "reason": reanalysis.reanalysis_reason,
+            "created_at": reanalysis.created_at,
+            "status": reanalysis.status,
+            "processing_time_ms": reanalysis.processing_time_ms,
+            "analysis_params": reanalysis.analysis_params,
+            "analysis": reanalysis.reanalysis_data,
+            "action_items_summary": {
+                "total": len(reanalysis.reanalysis_data.get("action_items", [])),
+                "by_owner": [
+                    {
+                        "owner": item.get("owner"),
+                        "task_count": item.get("task", "").count(";") + 1 if item.get("task") else 0
+                    }
+                    for item in reanalysis.reanalysis_data.get("action_items", [])
+                ]
+            }
+        }
+    )
+#####################end analyzer integration##############
 
 
 @router.get("/user/status")
@@ -2117,1254 +3160,4 @@ def list_knowledge_bases(
             errors=[{"field": "server", "message": str(e)}],
             status_code=500,
         )
-
-
-#  API KEYS
-@router.post("/workspaces/{workspace_id}/api-keys")
-def create_api_key(
-    workspace_id: int,
-    payload: dict = Body(...),  # expecting: { "name": "my key name" }
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    if not is_user_in_workspace(current_user.id, workspace_id, db):
-        raise HTTPException(
-            status_code=403, detail="You do not have access to this workspace"
-        )
-
-    workspace = db.query(Workspace).filter_by(id=workspace_id).first()
-    if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-
-    key_value = generate_api_key()
-    api_key = APIKey(
-        workspace_id=workspace.id,
-        name=payload["name"],
-        key_value=key_value,
-        created_by=current_user.id,
-    )
-    db.add(api_key)
-    db.commit()
-    db.refresh(api_key)
-
-    return format_response(
-        status=True,
-        message="API Key created successfully",
-        data={
-            "id": api_key.id,
-            "name": api_key.name,
-            "key_value": api_key.key_value,
-            "last_edited_by": current_user.username,
-            "updated_at": api_key.updated_at.isoformat(),
-        },
-    )
-
-
-@router.get("/workspaces/{workspace_id}/api-keys")
-def list_api_keys(
-    workspace_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    if not is_user_in_workspace(current_user.id, workspace_id, db):
-        raise HTTPException(
-            status_code=403, detail="You do not have access to this workspace"
-        )
-
-    keys = db.query(APIKey).filter_by(workspace_id=workspace_id).all()
-    data = [
-        {
-            "id": key.id,
-            "name": key.name,
-            "key_value": key.key_value,
-            "last_edited_by": current_user.username,
-            "updated_at": key.updated_at.isoformat(),
-            "is_webhook_key": key.is_webhook_key,
-        }
-        for key in keys
-    ]
-
-    return format_response(
-        status=True, message="API keys fetched successfully", data=data
-    )
-
-
-@router.delete("/workspaces/{workspace_id}/api-keys/{key_id}")
-def delete_api_key(
-    workspace_id: int,
-    key_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    # Check if the user is authorized in this workspace
-    if not is_user_in_workspace(current_user.id, workspace_id, db):
-        raise HTTPException(
-            status_code=403, detail="You do not have access to this workspace"
-        )
-
-    # Fetch the specific API key under that workspace
-    key = db.query(APIKey).filter_by(id=key_id, workspace_id=workspace_id).first()
-    if not key:
-        raise HTTPException(
-            status_code=404, detail="API key not found in this workspace"
-        )
-
-    if key.is_webhook_key:
-        raise HTTPException(
-            status_code=403,
-            detail="Cannot delete webhook key. Create a new key and set as webhook key first before deleting this key.",
-        )
-
-    db.delete(key)
-    db.commit()
-
-    return format_response(status=True, message="API key deleted successfully")
-
-
-@router.put("/api-keys/{key_id}/rename")
-def update_api_key_name(
-    key_id: int,
-    name: str = Body(...),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    key = db.query(APIKey).filter_by(id=key_id).first()
-    if not key:
-        raise HTTPException(status_code=404, detail="API key not found")
-
-    key.name = name
-    key.updated_at = datetime.utcnow()
-    key.created_by = current_user.id
-    db.commit()
-    return {"message": "API key renamed"}
-
-
-@router.put("/api-keys/{key_id}/set-webhook")
-def set_webhook_api_key(
-    key_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    key = db.query(APIKey).filter_by(id=key_id).first()
-    if not key:
-        raise HTTPException(status_code=404, detail="API key not found")
-
-    # Clear existing webhook key
-    db.query(APIKey).filter(
-        APIKey.workspace_id == key.workspace_id, APIKey.is_webhook_key == True
-    ).update({"is_webhook_key": False})
-
-    key.is_webhook_key = True
-    db.commit()
-    return {"message": "Webhook API key set"}
-
-
-__all__ = ["router"]
-
-
-@router.post("/agents")
-async def create_agent(
-    payload: AgentCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    if not is_user_in_workspace(current_user.id, payload.workspace_id, db):
-        raise HTTPException(
-            status_code=403, detail="You do not have access to this workspace"
-        )
-    is_valid = await validate_voice_id(payload.voice_id)
-    # print(f"is_valid: {is_valid}")
-    if not is_valid:
-        raise HTTPException(
-            status_code=400,
-            detail="Voice ID not found or invalid in ElevenLabs"
-        )
-
-
-    new_agent = pbx_ai_agent(
-        workspace_id=payload.workspace_id,
-        name=payload.agent_name,
-        voice_id=payload.voice_id,
-        voice_model=payload.voice_model,
-        fallback_voice_ids=payload.fallback_voice_ids,
-        voice_temperature=payload.voice_temperature,
-        voice_speed=payload.voice_speed,
-        volume=payload.volume,
-        responsiveness=payload.responsiveness,
-        interruption_sensitivity=payload.interruption_sensitivity,
-        enable_backchannel=payload.enable_backchannel,
-        backchannel_frequency=payload.backchannel_frequency,
-        backchannel_words=payload.backchannel_words,
-        reminder_trigger_ms=payload.reminder_trigger_ms,
-        reminder_max_count=payload.reminder_max_count,
-        ambient_sound=payload.ambient_sound,
-        ambient_sound_volume=payload.ambient_sound_volume,
-        language=payload.language,
-        webhook_url=payload.webhook_url,
-        boosted_keywords=payload.boosted_keywords,
-        opt_out_sensitive_data_storage=payload.opt_out_sensitive_data_storage,
-        opt_in_signed_url=payload.opt_in_signed_url,
-        pronunciation_dictionary=(
-            [p.model_dump() for p in payload.pronunciation_dictionary]
-            if payload.pronunciation_dictionary
-            else None
-        ),
-        normalize_for_speech=payload.normalize_for_speech,
-        end_call_after_silence_ms=payload.end_call_after_silence_ms,
-        max_call_duration_ms=payload.max_call_duration_ms,
-        post_call_analysis_data=(
-            [a.model_dump() for a in payload.post_call_analysis_data]
-            if payload.post_call_analysis_data
-            else None
-        ),
-        post_call_analysis_model=payload.post_call_analysis_model,
-        begin_message_delay_ms=payload.begin_message_delay_ms,
-        ring_duration_ms=payload.ring_duration_ms,
-        stt_mode=payload.stt_mode,
-        vocab_specialization=payload.vocab_specialization,
-        allow_user_dtmf=payload.allow_user_dtmf,
-        user_dtmf_options=(
-            payload.user_dtmf_options.model_dump()
-            if payload.user_dtmf_options
-            else None
-        ),
-        denoising_mode=payload.denoising_mode,
-        response_engine=(
-            payload.response_engine.model_dump() if payload.response_engine else None
-        ),
-        version=payload.version,
-        last_modification_timestamp=int(time.time() * 1000),
-        voicemail_option=(
-            payload.voicemail_option.model_dump() if payload.voicemail_option else None
-        ),
-    )
-
-    db.add(new_agent)
-    db.commit()
-    db.refresh(new_agent)
-
-    response_data = {
-        "agent_id": str(new_agent.id),
-        "last_modification_timestamp": new_agent.last_modification_timestamp,
-        "agent_name": new_agent.name,
-        "response_engine": new_agent.response_engine,
-        "language": new_agent.language,
-        "opt_out_sensitive_data_storage": new_agent.opt_out_sensitive_data_storage,
-        "opt_in_signed_url": new_agent.opt_in_signed_url,
-        "end_call_after_silence_ms": new_agent.end_call_after_silence_ms,
-        "version": new_agent.version,
-        "is_published": new_agent.is_published,
-        "post_call_analysis_model": new_agent.post_call_analysis_model,
-        "voice_id": new_agent.voice_id,
-        "voice_model": new_agent.voice_model,
-        "fallback_voice_ids": new_agent.fallback_voice_ids,
-        "voice_temperature": new_agent.voice_temperature,
-        "voice_speed": new_agent.voice_speed,
-        "volume": new_agent.volume,
-        "enable_backchannel": new_agent.enable_backchannel,
-        "backchannel_frequency": new_agent.backchannel_frequency,
-        "backchannel_words": new_agent.backchannel_words,
-        "reminder_trigger_ms": new_agent.reminder_trigger_ms,
-        "reminder_max_count": new_agent.reminder_max_count,
-        "max_call_duration_ms": new_agent.max_call_duration_ms,
-        "interruption_sensitivity": new_agent.interruption_sensitivity,
-        "ambient_sound": new_agent.ambient_sound,
-        "ambient_sound_volume": new_agent.ambient_sound_volume,
-        "responsiveness": new_agent.responsiveness,
-        "normalize_for_speech": new_agent.normalize_for_speech,
-        "begin_message_delay_ms": new_agent.begin_message_delay_ms,
-        "ring_duration_ms": new_agent.ring_duration_ms,
-        "stt_mode": new_agent.stt_mode,
-        "vocab_specialization": new_agent.vocab_specialization,
-        "allow_user_dtmf": new_agent.allow_user_dtmf,
-        "user_dtmf_options": new_agent.user_dtmf_options,
-        "denoising_mode": new_agent.denoising_mode,
-        "webhook_url": new_agent.webhook_url,
-        "boosted_keywords": new_agent.boosted_keywords,
-        "pronunciation_dictionary": new_agent.pronunciation_dictionary,
-        "voicemail_option": new_agent.voicemail_option,
-        "post_call_analysis_data": new_agent.post_call_analysis_data,
-    }
-
-    return {"status": True, "data": response_data}
-
-
-@router.delete("/agent/delete-agent/{agent_id}")
-def delete_agent(
-    agent_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    agent = db.query(pbx_ai_agent).filter(pbx_ai_agent.id == agent_id).first()
-    if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
-
-    if not is_user_in_workspace(current_user.id, agent.workspace_id, db):
-        raise HTTPException(
-            status_code=403, detail="You do not have access to this workspace"
-        )
-
-    # 🗑️ Delete the agent
-    db.delete(agent)
-    db.commit()
-
-    return {"status": True, "message": f"Agent deleted successfully", "data": None}
-
-
-import httpx
-
-
-async def get_elevenlabs_voice_name(voice_id: str) -> str:
-    """Fetch ElevenLabs voice name by ID"""
-    headers = {
-        "xi-api-key": ELEVEN_API_KEY,
-    }
-    url = f"{ELEVENLABS_VOICE_URL}/{voice_id}"
-
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-
-    if response.status_code != 200:
-        return "Unknown Voice"
-
-    data = response.json()
-    return data.get("name", "Unknown Voice")
-
-# listing conv flow agent
-@router.get("/all-agents/{workspace_id}")
-async def list_my_agents(
-    workspace_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    if not is_user_in_workspace(current_user.id, workspace_id, db):
-        raise HTTPException(
-            status_code=403, detail="You do not have access to this workspace"
-        )
-    try:
-        from sqlalchemy import cast, String, or_
-
-        # Get all workspace IDs the user is a member of
-        workspace_ids = (
-            select(WorkspaceMember.workspace_id)
-            .filter(WorkspaceMember.user_id == current_user.id)
-        )
-
-        # Fetch agents in those workspaces
-        agents = (
-            db.query(pbx_ai_agent)
-            .filter(pbx_ai_agent.workspace_id.in_(workspace_ids))
-            .all()
-        )
-
-        # Helper: parse response_engine into dict safely
-        def _parse_response_engine(val):
-            if val is None:
-                return {}
-            if isinstance(val, dict):
-                return val
-            if isinstance(val, str):
-                import json
-                try:
-                    parsed = json.loads(val)
-                    if isinstance(parsed, dict):
-                        return parsed
-                except Exception:
-                    return {}
-            return {}
-
-        # Helper: canonical flow id preferring uuid else conversation_flow_<id>
-        def _canonical_flow_id(flow):
-            if not flow:
-                return None
-            if getattr(flow, "uuid", None):
-                return str(flow.uuid)
-            if getattr(flow, "id", None) is not None:
-                return f"conversation_flow_{flow.id}"
-            return None
-
-        # Build base agent list (unchanged behaviour)
-        agent_list = []
-        # track conversation_flow_ids already present directly in agent.response_engine
-        seen_flow_ids = set()
-
-        for agent in agents:
-            response_engine_value = _parse_response_engine(agent.response_engine)
-
-            # capture conversation_flow_id if agent already references it
-            if isinstance(response_engine_value, dict):
-                for key in ("conversation_flow_id", "conversationFlowId", "conversationFlow", "conversation_flow", "flow_id"):
-                    if key in response_engine_value and response_engine_value.get(key):
-                        seen_flow_ids.add(str(response_engine_value.get(key)))
-                        break
-
-            voice_name = await get_elevenlabs_voice_name(agent.voice_id)
-
-            agent_list.append(
-                {
-                    "agent_id": agent.id,
-                    "version": agent.version,
-                    "is_published": agent.is_published,
-                    "response_engine": response_engine_value or {},
-                    "agent_name": agent.name,
-                    "voice_id": agent.voice_id,
-                    "voice_name": voice_name,
-                    "voice_model": agent.voice_model,
-                    "fallback_voice_ids": agent.fallback_voice_ids or [],
-                    "voice_temperature": agent.voice_temperature,
-                    "voice_speed": agent.voice_speed,
-                    "volume": agent.volume,
-                    "responsiveness": agent.responsiveness,
-                    "interruption_sensitivity": agent.interruption_sensitivity,
-                    "enable_backchannel": agent.enable_backchannel,
-                    "backchannel_frequency": agent.backchannel_frequency,
-                    "backchannel_words": agent.backchannel_words or [],
-                    "reminder_trigger_ms": agent.reminder_trigger_ms,
-                    "reminder_max_count": agent.reminder_max_count,
-                    "ambient_sound": agent.ambient_sound,
-                    "ambient_sound_volume": agent.ambient_sound_volume,
-                    "language": agent.language,
-                    "webhook_url": agent.webhook_url,
-                    "boosted_keywords": agent.boosted_keywords or [],
-                    "opt_out_sensitive_data_storage": agent.opt_out_sensitive_data_storage,
-                    "opt_in_signed_url": agent.opt_in_signed_url,
-                    "pronunciation_dictionary": agent.pronunciation_dictionary or [],
-                    "normalize_for_speech": agent.normalize_for_speech,
-                    "end_call_after_silence_ms": agent.end_call_after_silence_ms,
-                    "max_call_duration_ms": agent.max_call_duration_ms,
-                    "voicemail_option": agent.voicemail_option or {},
-                    "post_call_analysis_data": agent.post_call_analysis_data or [],
-                    "post_call_analysis_model": agent.post_call_analysis_model,
-                    "begin_message_delay_ms": agent.begin_message_delay_ms,
-                    "ring_duration_ms": agent.ring_duration_ms,
-                    "stt_mode": agent.stt_mode,
-                    "vocab_specialization": agent.vocab_specialization,
-                    "allow_user_dtmf": agent.allow_user_dtmf,
-                    "user_dtmf_options": agent.user_dtmf_options or {},
-                    "denoising_mode": agent.denoising_mode,
-                    "last_modification_timestamp": agent.last_modification_timestamp,
-                }
-            )
-
-        # --- Load conversational flows that are active ---
-        try:
-            flows_q = db.query(ConversationalFlow).filter(ConversationalFlow.is_active == True)
-            # if flows are workspace-scoped
-            if hasattr(ConversationalFlow, "workspace_id"):
-                flows_q = flows_q.filter(ConversationalFlow.workspace_id == workspace_id)
-            flows = flows_q.all()
-        except Exception:
-            flows = []
-
-        # For each flow, attempt to resolve a real agent via 3 strategies:
-        # 1) flow.agent_id / flow.agent_uuid
-        # 2) agent.response_engine contains flow.uuid or conversation_flow_<id> (text search)
-        # 3) fallback: agent.name == flow.name (last resort)
-        added_pairs = set()  # (agent_id, canonical_flow_id) to avoid duplicates
-
-        for flow in flows:
-            canonical = _canonical_flow_id(flow)
-            if canonical and str(canonical) in seen_flow_ids:
-                # agent already directly references this flow -> skip adding duplicate
-                continue
-
-            matched_agent = None
-
-            # Strategy 1: flow stores agent reference fields
-            for fld in ("agent_id", "agent_uuid"):
-                try:
-                    aid = getattr(flow, fld, None)
-                    if aid:
-                        candidate = db.query(pbx_ai_agent).filter(pbx_ai_agent.id == str(aid)).one_or_none()
-                        if candidate:
-                            matched_agent = candidate
-                            break
-                except Exception:
-                    continue
-            if matched_agent:
-                pass
-
-            # Strategy 2: search agent.response_engine string for flow identifiers
-            if not matched_agent and canonical:
-                try:
-                    pattern1 = f"%{canonical}%"
-                    # also search by flow.uuid explicitly if it exists
-                    pattern2 = f"%{getattr(flow,'uuid', '')}%"
-                    candidate = (
-                        db.query(pbx_ai_agent)
-                        .filter(
-                            or_(
-                                cast(pbx_ai_agent.response_engine, String).ilike(pattern1),
-                                cast(pbx_ai_agent.response_engine, String).ilike(pattern2),
-                            )
-                        )
-                        .first()
-                    )
-                    if candidate:
-                        matched_agent = candidate
-                except Exception:
-                    matched_agent = None
-
-            # Strategy 3: fallback name match (only if flow.name exists)
-            if not matched_agent and getattr(flow, "name", None):
-                try:
-                    candidate = db.query(pbx_ai_agent).filter(pbx_ai_agent.name == flow.name).first()
-                    if candidate:
-                        matched_agent = candidate
-                except Exception:
-                    matched_agent = None
-
-            # If still no match, skip this flow
-            if not matched_agent:
-                continue
-
-            # avoid duplicates
-            flow_key = canonical or str(getattr(flow, "id", ""))
-            pair = (str(matched_agent.id), flow_key)
-            if pair in added_pairs:
-                continue
-            added_pairs.add(pair)
-
-            # Build conversation-flow payload using matched_agent metadata (so agent_name is correct)
-            conv_re = {"type": "conversation-flow", "version": getattr(matched_agent, "version", 0)}
-            if flow_key:
-                conv_re["conversation_flow_id"] = flow_key
-
-            convo_payload = {
-                "agent_id": matched_agent.id,
-                "channel": getattr(matched_agent, "channel", None) or "chat",
-                "last_modification_timestamp": getattr(flow, "updated_at", None) or getattr(flow, "created_at", None),
-                "agent_name": matched_agent.name,
-                "response_engine": conv_re,
-                "language": getattr(matched_agent, "language", None) or getattr(flow, "language", None) or "en-US",
-                "data_storage_setting": getattr(matched_agent, "data_storage_setting", None) or getattr(matched_agent, "data_storage", "everything"),
-                "opt_in_signed_url": matched_agent.opt_in_signed_url if hasattr(matched_agent, "opt_in_signed_url") else False,
-                "version": matched_agent.version or 0,
-                "is_published": matched_agent.is_published,
-                "post_call_analysis_model": getattr(matched_agent, "post_call_analysis_model", None),
-                "pii_config": getattr(matched_agent, "pii_config", None) or {"mode": "post_call", "categories": []},
-                "post_chat_analysis_model": getattr(matched_agent, "post_chat_analysis_model", None),
-            }
-
-            # Append if not already existing in agent_list (match by agent_id + conversation_flow_id)
-            exists = False
-            for ex in agent_list:
-                try:
-                    if str(ex.get("agent_id")) == str(convo_payload["agent_id"]):
-                        ex_re = ex.get("response_engine", {})
-                        if ex_re and ex_re.get("conversation_flow_id") == conv_re.get("conversation_flow_id"):
-                            exists = True
-                            break
-                except Exception:
-                    continue
-            if not exists:
-                agent_list.append(convo_payload)
-
-        return format_response(status=True, message="Agents fetched successfully", data=agent_list)
-
-    except Exception as e:
-        db.rollback()
-        return format_response(status=False, message=f"Internal Server Error: {str(e)}", data=None)
-
-
-@router.patch("/agent/update-agent/{agent_id}")
-async def update_agent(
-    agent_id: str,
-    payload: AgentUpdate,  # ✅ using optional fields schema
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    agent = db.query(pbx_ai_agent).filter(pbx_ai_agent.id == agent_id).first()
-    if not agent:
-        raise HTTPException(status_code=404, detail="Agent not found")
-    if not is_user_in_workspace(current_user.id, agent.workspace_id, db):
-        raise HTTPException(
-            status_code=403, detail="You do not have access to this workspace"
-        )
-
-    update_data = payload.dict(exclude_unset=True)
-    # Map `agent_name` in payload to `name` in DB model
-    if "agent_name" in update_data:
-        update_data["name"] = update_data.pop("agent_name")
-    if not update_data:
-        raise HTTPException(status_code=400, detail="No fields provided for update")
-    
-    if "voice_id" in update_data:
-        is_valid = await validate_voice_id(update_data["voice_id"])
-        if not is_valid:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid voice_id: Voice not found or not supported by ElevenLabs",
-            )
-
-    for field, value in update_data.items():
-        if hasattr(agent, field):
-            setattr(agent, field, value)
-        else:
-            print(f"⚠️ Skipped unknown field: {field}")
-
-    agent.last_modification_timestamp = int(time.time() * 1000)
-
-    db.add(agent)  # ✅ Ensure it's tracked
-    db.commit()
-    db.refresh(agent)
-
-    response_data = {
-        "agent_id": str(agent.id),
-        "last_modification_timestamp": agent.last_modification_timestamp,
-        "agent_name": agent.name,
-        "response_engine": agent.response_engine,
-        "language": agent.language,
-        "opt_out_sensitive_data_storage": agent.opt_out_sensitive_data_storage,
-        "opt_in_signed_url": agent.opt_in_signed_url,
-        "end_call_after_silence_ms": agent.end_call_after_silence_ms,
-        "version": agent.version,
-        "is_published": agent.is_published,
-        "post_call_analysis_model": agent.post_call_analysis_model,
-        "voice_id": agent.voice_id,
-        "voice_model": agent.voice_model,
-        "fallback_voice_ids": agent.fallback_voice_ids,
-        "voice_temperature": agent.voice_temperature,
-        "voice_speed": agent.voice_speed,
-        "volume": agent.volume,
-        "enable_backchannel": agent.enable_backchannel,
-        "backchannel_frequency": agent.backchannel_frequency,
-        "backchannel_words": agent.backchannel_words,
-        "reminder_trigger_ms": agent.reminder_trigger_ms,
-        "reminder_max_count": agent.reminder_max_count,
-        "max_call_duration_ms": agent.max_call_duration_ms,
-        "interruption_sensitivity": agent.interruption_sensitivity,
-        "ambient_sound": agent.ambient_sound,
-        "ambient_sound_volume": agent.ambient_sound_volume,
-        "responsiveness": agent.responsiveness,
-        "normalize_for_speech": agent.normalize_for_speech,
-        "begin_message_delay_ms": agent.begin_message_delay_ms,
-        "ring_duration_ms": agent.ring_duration_ms,
-        "stt_mode": agent.stt_mode,
-        "vocab_specialization": agent.vocab_specialization,
-        "allow_user_dtmf": agent.allow_user_dtmf,
-        "user_dtmf_options": agent.user_dtmf_options,
-        "denoising_mode": agent.denoising_mode,
-        "webhook_url": agent.webhook_url,
-        "boosted_keywords": agent.boosted_keywords,
-        "pronunciation_dictionary": agent.pronunciation_dictionary,
-        "voicemail_option": agent.voicemail_option,
-        "post_call_analysis_data": agent.post_call_analysis_data,
-    }
-
-    return {
-        "status": True,
-        "message": "Agent updated successfully",
-        "data": response_data,
-    }
-
-
-
-@router.post("/pbx-llms", response_model=PBXLLMOut)
-def create_pbx_llm(
-    payload: PBXLLMCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    # Validate workspace access
-    if not is_user_in_workspace(current_user.id, payload.workspace_id, db):
-        raise HTTPException(
-            status_code=403, detail="You do not have access to this workspace"
-        )
-
-    workspace = db.query(Workspace).filter(Workspace.id == payload.workspace_id).first()
-    if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-
-    llm = PBXLLM(
-        workspace_id=payload.workspace_id,
-        version=payload.version,
-        model=payload.model,
-        s2s_model=payload.s2s_model,
-        model_temperature=payload.model_temperature,
-        model_high_priority=payload.model_high_priority,
-        tool_call_strict_mode=payload.tool_call_strict_mode,
-        general_prompt=payload.general_prompt,
-        general_tools=payload.general_tools,
-        states=payload.states,
-        starting_state=payload.starting_state,
-        begin_message=payload.begin_message,
-        default_dynamic_variables=payload.default_dynamic_variables,
-        knowledge_base_ids=payload.knowledge_base_ids,
-        last_modification_timestamp=int(time.time() * 1000),
-    )
-    db.add(llm)
-    db.commit()
-    db.refresh(llm)
-    return PBXLLMOut(status=True, llm_id=f"{llm.id}")
-
-
-@router.delete("/delete-pbx-llm/{llm_id}")
-def delete_pbx_llm(
-    llm_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    # Fetch the PBXLLM
-    llm = db.query(PBXLLM).filter(PBXLLM.id == llm_id).first()
-    if not llm:
-        return format_response(
-            status=False,
-            message="PBXLLM not found",
-            errors=[{"field": "llm_id", "message": "PBXLLM not found"}],
-            status_code=404,
-        )
-
-    # Validate workspace access
-    if not is_user_in_workspace(current_user.id, llm.workspace_id, db):
-        return format_response(
-            status=False,
-            message="Access denied",
-            errors=[
-                {
-                    "field": "workspace",
-                    "message": "You do not have access to this workspace",
-                }
-            ],
-            status_code=403,
-        )
-
-    # Delete PBXLLM
-    db.delete(llm)
-    db.commit()
-
-    return format_response(status=True, message="LLM deleted successfully", data=None)
-
-
-@router.get("/pbx-llm/{llm_id}")
-def get_pbx_llm(
-    llm_id: str,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    # Fetch PBXLLM by id
-    llm = db.query(PBXLLM).filter(PBXLLM.id == llm_id).first()
-
-    if not llm:
-        # Return 404 if not found
-        return JSONResponse(
-            status_code=404,
-            content={
-                "status": False,
-                "message": f"LLM with id {llm_id} not found",
-                "data": None,
-            },
-        )
-
-    # Build response data
-    llm_data = {
-        "llm_id": llm.id,
-        "version": llm.version,
-        "model": llm.model,
-        "s2s_model": llm.s2s_model,
-        "model_temperature": llm.model_temperature,
-        "model_high_priority": llm.model_high_priority,
-        "tool_call_strict_mode": llm.tool_call_strict_mode,
-        "general_prompt": llm.general_prompt,
-        "general_tools": llm.general_tools,
-        "states": llm.states,
-        "starting_state": llm.starting_state,
-        "begin_message": llm.begin_message,
-        "default_dynamic_variables": llm.default_dynamic_variables,
-        "knowledge_base_ids": llm.knowledge_base_ids,
-        "last_modification_timestamp": llm.last_modification_timestamp,
-        "is_published": llm.is_published,
-    }
-
-    # Return wrapped response
-    return JSONResponse(
-        status_code=200, content={"status": True, "message": "", "data": llm_data}
-    )
-
-
-
-
-
-# Constants you requested (change if needed)
-TWILIO_ADDRESS = "ucaas-testing.pstn.twilio.com"
-TWILIO_AUTH_USER = "natty"
-TWILIO_AUTH_PASS = "Passw0rd@123"
-
-
-def _normalize_e164(n: str) -> str:
-    """Return normalized +E164 string (leading '+')."""
-    if not n:
-        return n
-    # Keep digits and leading plus only
-    cleaned = re.sub(r"[^\d+]", "", n)
-    if cleaned.startswith("+"):
-        return cleaned
-    return f"+{cleaned}"
-
-
-def _pick_id(trunk_obj) -> Optional[str]:
-    """
-    Try multiple attribute names for trunk id across SDK versions / response wraps.
-    Handles:
-      - trunk_obj.sip_outbound_trunk_id
-      - trunk_obj.trunk_id
-      - trunk_obj.id
-      - trunk_obj.trunk.sip_outbound_trunk_id
-      - trunk_obj.trunk (object)
-    """
-    if trunk_obj is None:
-        return None
-    # direct properties
-    for attr in ("sip_outbound_trunk_id", "trunk_id", "id"):
-        val = getattr(trunk_obj, attr, None)
-        if val:
-            return val
-    # nested shapes
-    nested = getattr(trunk_obj, "trunk", None)
-    if nested:
-        for attr in ("sip_outbound_trunk_id", "trunk_id", "id"):
-            val = getattr(nested, attr, None)
-            if val:
-                return val
-    return None
-
-
-async def ensure_outbound_trunk_for_number(phone_number: str) -> str:
-    """
-    Ensure a LiveKit SIP outbound trunk is available that includes the provided phone_number.
-    Returns the trunk id that now contains the number.
-    """
-    desired = _normalize_e164(phone_number)
-    lkapi = api.LiveKitAPI()
-    try:
-        resp = await lkapi.sip.list_sip_outbound_trunk(ListSIPOutboundTrunkRequest())
-        trunks = getattr(resp, "items", []) or []
-
-        # 1) If any trunk already contains the number, return its id
-        for t in trunks:
-            existing_numbers: List[str] = getattr(t, "numbers", []) or []
-            normalized = {_normalize_e164(x) for x in existing_numbers if x}
-            if desired in normalized:
-                tid = _pick_id(t)
-                if tid:
-                    logging.info(f"Found existing trunk {tid} containing {desired}; reusing.")
-                    return tid
-
-        # 2) Prefer to add to a trunk that has the TWILIO_ADDRESS or name 'transfer trunk'
-        candidate = None
-        by_name = None
-        for t in trunks:
-            address = getattr(t, "address", "") or ""
-            name = getattr(t, "name", "") or ""
-            if address == TWILIO_ADDRESS:
-                candidate = t
-                break
-            if name.lower() == "transfer trunk":
-                by_name = t
-        if candidate is None:
-            candidate = by_name
-
-        if candidate:
-            tid = _pick_id(candidate)
-            if tid:
-                logging.info(f"Adding {desired} to existing trunk {tid} (candidate).")
-                await lkapi.sip.update_sip_outbound_trunk_fields(
-                    trunk_id=tid,
-                    numbers=ListUpdate(add=[desired], remove=[]),
-                )
-                return tid
-
-        # 3) Create a new trunk
-        unique_name = f"transfer-trunk-{uuid.uuid4().hex[:8]}"
-        trunk_info = api.SIPOutboundTrunkInfo(
-            name=unique_name,
-            address=TWILIO_ADDRESS,
-            numbers=[desired],
-            auth_username=TWILIO_AUTH_USER,
-            auth_password=TWILIO_AUTH_PASS,
-        )
-
-        created = await lkapi.sip.create_sip_outbound_trunk(CreateSIPOutboundTrunkRequest(trunk=trunk_info))
-
-        # try to pick id from response
-        new_id = _pick_id(created) or _pick_id(getattr(created, "trunk", None))
-        if not new_id:
-            # fallback: re-list and find by name we created
-            rel = await lkapi.sip.list_sip_outbound_trunk(ListSIPOutboundTrunkRequest())
-            for t in getattr(rel, "items", []) or []:
-                if getattr(t, "name", "") == unique_name:
-                    new_id = _pick_id(t)
-                    break
-
-        if not new_id:
-            raise RuntimeError("Could not determine id of newly created trunk")
-
-        logging.info(f"Created new trunk {new_id} with name {unique_name} for number {desired}")
-        return new_id
-
-    finally:
-        await lkapi.aclose()
-
-
-async def remove_number_from_trunk(phone_number: str) -> Optional[str]:
-    """
-    Remove the given number from any trunk that contains it. Returns trunk id removed from, or None.
-    """
-    desired = _normalize_e164(phone_number)
-    lkapi = api.LiveKitAPI()
-    try:
-        resp = await lkapi.sip.list_sip_outbound_trunk(ListSIPOutboundTrunkRequest())
-        trunks = getattr(resp, "items", []) or []
-        for t in trunks:
-            existing_numbers: List[str] = getattr(t, "numbers", []) or []
-            normalized = {_normalize_e164(x) for x in existing_numbers if x}
-            if desired in normalized:
-                tid = _pick_id(t)
-                if not tid:
-                    continue
-                await lkapi.sip.update_sip_outbound_trunk_fields(
-                    trunk_id=tid,
-                    numbers=ListUpdate(add=[], remove=[desired]),
-                )
-                logging.info(f"Removed {desired} from trunk {tid}")
-                return tid
-        return None
-    finally:
-        await lkapi.aclose()
-
-# === Updated endpoint (async) ===
-@router.patch("/pbx-llms/update-llm/{llm_id}")
-async def update_pbx_llm(
-    llm_id: str,
-    payload: PBXLLMCreate,  # Or PBXLLMUpdate where fields are Optional
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    # Fetch PBXLLM by ID
-    llm = db.query(PBXLLM).filter(PBXLLM.id == llm_id).first()
-    if not llm:
-        raise HTTPException(status_code=404, detail=f"LLM with id {llm_id} not found")
-
-    # Check workspace access
-    if not is_user_in_workspace(current_user.id, llm.workspace_id, db):
-        raise HTTPException(status_code=403, detail="You do not have access to this workspace")
-
-    # Apply only provided fields
-    update_data = payload.dict(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(llm, field, value)
-
-    # If general_tools updated (or present), process transfer_call tool
-    try:
-        tools_candidate = update_data.get("general_tools", None)
-        # If not provided in update payload, use existing llm.general_tools
-        tools_candidate = tools_candidate if tools_candidate is not None else llm.general_tools or []
-
-        # some code paths store general_tools as tuple/list
-        if isinstance(tools_candidate, tuple):
-            tools_candidate = tools_candidate[0]
-
-        transfer_tool = next((t for t in (tools_candidate or []) if t.get("type") == "transfer_call"), None)
-
-        # read previous transfer number (if we stored it previously); try to detect old number in llm.general_tools too
-        previous_number = None
-        try:
-            existing_tools = llm.general_tools or []
-            if isinstance(existing_tools, tuple):
-                existing_tools = existing_tools[0]
-            prev_tool = next((t for t in (existing_tools or []) if t.get("type") == "transfer_call"), None)
-            previous_dest = (prev_tool.get("transfer_destination") or {}) if prev_tool else {}
-            previous_number = previous_dest.get("number") or previous_dest.get("phone") or None
-        except Exception:
-            previous_number = None
-
-        # If transfer tool present and has a number -> ensure trunk contains it
-        if transfer_tool:
-            dest = transfer_tool.get("transfer_destination") or {}
-            new_number = dest.get("number") or dest.get("phone") or ""
-            new_number = new_number.strip() if isinstance(new_number, str) else ""
-            if new_number:
-                try:
-                    trunk_id = await ensure_outbound_trunk_for_number(new_number)
-                    # optionally save trunk id on llm for future reference if model has that column
-                    if hasattr(llm, "sip_outbound_trunk_id"):
-                        try:
-                            llm.sip_outbound_trunk_id = trunk_id
-                        except Exception:
-                            # ignore if DB model doesn't support or mapping differs
-                            pass
-                except Exception as e:
-                    # Do not fail the whole update if trunk provisioning fails; log and continue
-                    logging.exception(f"Failed to ensure trunk for number {new_number}: {e}")
-        else:
-            # transfer tool removed -> remove previous number from any trunk
-            if previous_number:
-                try:
-                    removed_from = await remove_number_from_trunk(previous_number)
-                    logging.info(f"Removed {previous_number} from trunk {removed_from}")
-                except Exception:
-                    logging.exception(f"Failed to remove previous transfer number {previous_number} from trunk")
-
-    except Exception:
-        # never block DB update on trunk operations; log and continue
-        logging.exception("Error while provisioning outbound trunk for transfer_call tool")
-
-    # Update timestamp & commit
-    llm.last_modification_timestamp = int(time.time() * 1000)
-    db.commit()
-    db.refresh(llm)
-
-    # Build response
-    updated_llm_data = {
-        "llm_id": llm.id,
-        "version": llm.version,
-        "model": llm.model,
-        "s2s_model": llm.s2s_model,
-        "model_temperature": llm.model_temperature,
-        "model_high_priority": llm.model_high_priority,
-        "tool_call_strict_mode": llm.tool_call_strict_mode,
-        "general_prompt": llm.general_prompt,
-        "general_tools": llm.general_tools,
-        "states": llm.states,
-        "starting_state": llm.starting_state,
-        "begin_message": llm.begin_message,
-        "default_dynamic_variables": llm.default_dynamic_variables,
-        "knowledge_base_ids": llm.knowledge_base_ids,
-        "last_modification_timestamp": llm.last_modification_timestamp,
-        "is_published": llm.is_published,
-        # optionally expose trunk id:
-        "sip_outbound_trunk_id": getattr(llm, "sip_outbound_trunk_id", None),
-    }
-
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": True,
-            "message": "LLM updated successfully",
-            "data": updated_llm_data,
-        },
-    )
-
-@router.get("/all-pbx-llms/{workspace_id}")
-def get_pbx_llm(
-    workspace_id=int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    try:
-        # Fetch the PBX LLM for the user's workspace
-        pbx_llm = db.query(PBXLLM).filter(PBXLLM.workspace_id == workspace_id).all()
-
-        if not pbx_llm:
-            return format_response(
-                status=False,
-                message="No LLM configuration found for this workspace",
-                data=None,
-                errors=[
-                    {
-                        "field": "workspace_id",
-                        "message": "No PBX LLM found for workspace",
-                    }
-                ],
-                status_code=404,
-            )
-
-        # Validate and serialize with Pydantic
-        pbx_llm_out_list = [GetPBXLLMOut.from_orm(llm).model_dump() for llm in pbx_llm]
-
-        return format_response(
-            status=True,
-            message="LLM configuration fetched successfully",
-            data=pbx_llm_out_list,
-        )
-
-    except Exception as e:
-        return format_response(
-            status=False,
-            message="Failed to fetch LLM configuration",
-            errors=[{"field": "server", "message": str(e)}],
-            status_code=500,
-        )
-
-
-# Chat room APIs--------------------------------------------------
-@router.post("/create-chat", response_model=CreateChatResponse)
-def create_chat(payload: CreateChatRequest, db: Session = Depends(get_db)):
-    try:
-        chat = ChatSession(
-            agent_id=payload.agent_id,
-            agent_version=payload.agent_version or 0,
-            chat_status=payload.chat_status,
-            llm_dynamic_variables=payload.llm_dynamic_variables,
-            collected_dynamic_variables={},
-            chat_metadata=payload.metadata,
-            start_timestamp=payload.start_timestamp,
-            end_timestamp=payload.end_timestamp,
-            transcript=payload.transcript or "null",
-            message_with_tool_calls=[],  # ensure it's a list of dicts or JSON-serializable
-            chat_cost=payload.chat_cost.model_dump() if payload.chat_cost else None,
-            chat_analysis=(
-                payload.chat_analysis.model_dump() if payload.chat_analysis else None
-            ),
-        )
-
-        db.add(chat)
-        db.commit()
-        db.refresh(chat)
-
-        return CreateChatResponse(
-            chat_id=chat.chat_id,
-            agent_id=chat.agent_id,
-            chat_status=chat.chat_status,
-            llm_dynamic_variables=chat.llm_dynamic_variables,
-            collected_dynamic_variables=chat.collected_dynamic_variables,
-            start_timestamp=chat.start_timestamp,
-            end_timestamp=chat.end_timestamp,
-            transcript=chat.transcript,
-            message_with_tool_calls=chat.message_with_tool_calls,
-            metadata=chat.chat_metadata,
-            chat_cost=chat.chat_cost,
-            chat_analysis=chat.chat_analysis,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# voice
-@router.post("/llm-voice", response_model=VoiceOut)
-def create_voice(
-    payload: VoiceCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),  # optional if you want auth
-):
-    existing = db.query(LLMVoice).filter_by(voice_id=payload.voice_id).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Voice ID already exists")
-
-    voice = LLMVoice(**payload.dict())
-    db.add(voice)
-    db.commit()
-    db.refresh(voice)
-    return voice
-
-
-@router.get("/llm-voice/{voice_id}", response_model=VoiceOut)
-def get_voice(
-    voice_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    voice = db.query(LLMVoice).filter_by(voice_id=voice_id).first()
-    if not voice:
-        raise HTTPException(status_code=404, detail="Voice not found")
-
-    # Inject dynamic preview URL
-    voice.preview_audio_url = (
-        f"https://ai.webvio.in/backend-py/llm-voice/preview/{voice_id}"
-    )
-
-    return voice
-
-
-
-ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
-ELEVENLABS_VOICE_URL = "https://api.elevenlabs.io/v1/voices"
-# ELEVENLABS_CREATE_VOICE_URL = "https://api.elevenlabs.io/v1/voices/add"
-
-@router.get("/all-voices", response_model=APIResponse)
-async def list_voices(
-    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
-):
-    try:
-        headers = {
-            "xi-api-key": ELEVEN_API_KEY,
-        }
-
-        async with httpx.AsyncClient() as client:
-            response = await client.get(ELEVENLABS_VOICE_URL, headers=headers)
-
-        if response.status_code != 200:
-            raise Exception(f"ElevenLabs API error: {response.text}")
-
-        data = response.json()
-        voices_data = data.get("voices", [])
-
-        # Map ElevenLabs voice to your schema
-        formatted_voices = []
-        for voice in voices_data:
-            formatted_voices.append(
-                {
-                    "voice_id": voice["voice_id"],
-                    "voice_name": voice["name"],
-                    "provider": "elevenlabs",
-                    "gender": voice.get("labels", {}).get("gender", "unknown"),
-                    "accent": voice.get("labels", {}).get("accent", "unknown"),
-                    "age": voice.get("labels", {}).get("age", "unknown"),
-                    "preview_audio_url": voice.get("preview_url", ""),
-                }
-            )
-
-        # Validate and convert to VoiceOut
-        try:
-            voices = [VoiceOut.model_validate(voice) for voice in formatted_voices]
-        except ValueError as validation_error:
-            return APIResponse(
-                status=False,
-                message="Validation error",
-                data=None,
-                errors=[{"field": "voice_data", "message": str(validation_error)}],
-            )
-
-        return APIResponse(
-            status=True, message="Voices fetched successfully", data=voices, errors=[]
-        )
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "status": False,
-                "message": "Internal Server Error",
-                "data": None,
-                "errors": [{"field": "server", "message": str(e)}],
-            },
-        )
-
-@router.get("/llm-voice/preview/{voice_id}")
-async def generate_preview(
-    voice_id: str,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    # Optional: ensure voice exists
-    voice = db.query(LLMVoice).filter_by(voice_id=voice_id).first()
-    if not voice:
-        raise HTTPException(status_code=404, detail="Voice not found")
-
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-
-    payload = {
-        "text": "Hello! This is a preview of my cloned voice.",
-        "model_id": "eleven_multilingual_v2"
-    }
-
-    headers = {
-        "xi-api-key": ELEVEN_API_KEY,
-        "Content-Type": "application/json"
-    }
-
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=500,
-            detail=f"ElevenLabs Error: {resp.text}"
-        )
-
-    return StreamingResponse(
-        iter([resp.content]),
-        media_type="audio/mpeg"
-    )
-
 
